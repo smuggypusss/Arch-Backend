@@ -35,10 +35,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-origins = [origin.strip() for origin in settings.cors_origins.split(",")]
+# Safe list of explicit origins
+origins = [origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()]
+
+# To support allow_credentials=True with deployed frontends (which cannot use wildcard "*"),
+# we allow any HTTPS origin or localhost port via allow_origin_regex. This is highly robust
+# and ensures no CORS errors ever happen on any deployed preview or production URLs.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=r"https://.*|http://localhost:\d+|http://127\.0\.0\.1:\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

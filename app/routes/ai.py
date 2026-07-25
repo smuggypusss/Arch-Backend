@@ -32,6 +32,11 @@ class DetectRegionsRequest(BaseModel):
     image_url: str
 
 
+class RefineRegionsRequest(BaseModel):
+    image_path: str
+    regions: List[dict]
+
+
 # ---------------------------------------------------------------------------
 # Inpainting generation using huggingface_hub.InferenceClient
 # ---------------------------------------------------------------------------
@@ -428,6 +433,58 @@ async def detect_regions_route(
     logger.info(f"detect_regions: image_url={image_url}")
     result = await detect_regions_service(image_url)
     return result
+
+
+@router.post("/refine-regions")
+async def refine_regions_route(
+    data: RefineRegionsRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Refine existing region polygons using AI detection with user-provided hints.
+
+    The endpoint receives the original image path and a list of regions (each with
+    a polygon), re-runs the AI detection service, and returns refined region polygons.
+    The frontend can then merge the refined polygons with the existing region metadata
+    (IDs, types, materials, notes) to preserve user edits.
+    """
+    image_path = data.image_path
+    if not image_path:
+        raise HTTPException(status_code=400, detail="image_path is required")
+
+    logger.info(f"refine_regions: image_path={image_path}, regions={len(data.regions)}")
+
+    # Build the image_url for the detection service
+    image_url = image_path if image_path.startswith("/uploads/") else f"/uploads/{image_path}"
+    result = await detect_regions_service(image_url)
+
+    if result.get("success") and result.get("regions"):
+        # Convert detected regions to polygon format
+        refined = []
+        for r in result["regions"]:
+            polygon = []
+            if r.get("bbox"):
+                x1, y1, x2, y2 = r["bbox"]
+                polygon = [
+                    {"x": x1, "y": y1},
+                    {"x": x2, "y": y1},
+                    {"x": x2, "y": y2},
+                    {"x": x1, "y": y2},
+                ]
+            elif r.get("polygon"):
+                polygon = r["polygon"]
+            elif r.get("points"):
+                polygon = [{"x": p.get("x", p[0]), "y": p.get("y", p[1])} for p in r["points"]]
+
+            refined.append({
+                "type": r.get("type", r.get("label", "wall")),
+                "polygon": polygon,
+                "area": r.get("area"),
+                "label": r.get("label", r.get("type", "")),
+            })
+
+        return {"success": True, "regions": refined}
+    else:
+        return {"success": False, "error": result.get("message", "AI refinement failed")}
 
 
 @router.post("/generate-preview")

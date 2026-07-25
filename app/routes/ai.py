@@ -62,31 +62,12 @@ NEGATIVE_PROMPT = (
 
 def _build_material_prompt(region_type: str, material: str) -> str:
     region_desc = REGION_PROMPT_MAP.get(region_type, region_type)
-    return f"""You are editing an existing building photograph.
-
-This is a renovation visualization, NOT a redesign.
-
-Preserve:
-- the exact building geometry
-- roof shape
-- wall dimensions
-- window positions
-- door positions
-- balcony positions
-- camera angle
-- perspective
-- landscaping
-- neighboring buildings
-- lighting
-- shadows
-- reflections
-
-Only perform the following edits:
-- Replace the {region_desc} with {material}.
-
-Everything else in the image must remain unchanged.
-
-The output should be an ultra-photorealistic exterior renovation rendering."""
+    return (
+        f"An ultra-photorealistic, high-end professional architectural photograph of building exterior {region_desc} "
+        f"renovated with premium, beautifully textured {material}. "
+        f"Seamless design integration, realistic texture detailing, crisp material seams, and natural shadows. "
+        f"8k resolution, modern facade design, perfect daylight lighting, crisp detail, realistic depth."
+    )
 
 
 def _load_image(path: str) -> Image.Image:

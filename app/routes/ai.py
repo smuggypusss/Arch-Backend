@@ -56,6 +56,7 @@ REGION_PROMPT_MAP = {
 # Note: FLUX.1-Fill-dev is specifically optimized for mask-based inpainting.
 MODELS = [
     ("replicate", "black-forest-labs/FLUX.1-Kontext-dev"),
+    ("replicate", "black-forest-labs/FLUX.1-Fill-dev"),
     ("replicate", "Qwen/Qwen-Image-Edit"),
     ("wavespeed", "black-forest-labs/FLUX.1-Kontext-dev"),
     ("fal-ai", "Qwen/Qwen-Image-Edit"),
@@ -66,6 +67,13 @@ NEGATIVE_PROMPT = (
     "deformed, extra limbs, disfigured, text, signature, watermark, ugly, morbid, "
     "mutilated, disfigured hands, poorly drawn hands, poorly drawn face"
 )
+
+# Map HF model names to Replicate model IDs
+REPLICATE_MODEL_MAP = {
+    "black-forest-labs/FLUX.1-Kontext-dev": "black-forest-labs/flux-kontext-dev",
+    "black-forest-labs/FLUX.1-Fill-dev": "black-forest-labs/flux-dev",
+    "Qwen/Qwen-Image-Edit": "qwen/qwen-image-edit",
+}
 
 
 def _build_material_prompt(region_type: str, material: str) -> str:
@@ -111,20 +119,95 @@ async def _generate_material_image(
     provider: str,
     hf_token: str = None,
     mask: Image.Image = None,
+    replicate_token: str = None,
 ) -> Optional[Image.Image]:
-    """Generate a modified image using image_to_image with mask."""
+    """Generate a modified image using image_to_image with mask.
+
+    For 'replicate' provider, uses the Replicate SDK directly (bypasses
+    HF router's 60s timeout). For other providers, uses HF InferenceClient.
+    """
     import asyncio
-    from huggingface_hub import InferenceClient
 
     if mask is None:
         logger.warning(f"No mask provided for model {model_name}")
         return None
 
+    # Use Replicate SDK directly for replicate provider (longer timeout)
+    if provider == "replicate":
+        if not replicate_token:
+            logger.warning(f"No Replicate token available for model {model_name}")
+            return None
+
+        replicate_model_id = REPLICATE_MODEL_MAP.get(model_name, model_name.lower())
+        try:
+            import replicate as replicate_sdk
+
+            client = replicate_sdk.Client(api_token=replicate_token)
+
+            # Convert images to base64 data URIs
+            img_buffer = io.BytesIO()
+            image.save(img_buffer, format="PNG")
+            img_b64 = base64.b64encode(img_buffer.getvalue()).decode("utf-8")
+            img_data_uri = f"data:image/png;base64,{img_b64}"
+
+            mask_buffer = io.BytesIO()
+            mask.save(mask_buffer, format="PNG")
+            mask_b64 = base64.b64encode(mask_buffer.getvalue()).decode("utf-8")
+            mask_data_uri = f"data:image/png;base64,{mask_b64}"
+
+            def _call_replicate():
+                output = client.run(
+                    replicate_model_id,
+                    input={
+                        "input_image": img_data_uri,
+                        "mask": mask_data_uri,
+                        "prompt": prompt,
+                        "negative_prompt": NEGATIVE_PROMPT,
+                        "guidance_scale": 10.0,
+                        "num_inference_steps": 45,
+                        "output_format": "png",
+                    },
+                )
+
+                # Replicate SDK returns a FileOutput object with .url and .read()
+                # Handle FileOutput, URL string, or list of URLs
+                result_url = None
+                if hasattr(output, "url"):
+                    result_url = output.url
+                elif hasattr(output, "read"):
+                    # FileOutput with read() method — read bytes directly
+                    return Image.open(io.BytesIO(output.read())).convert("RGB")
+                elif isinstance(output, list) and len(output) > 0:
+                    result_url = output[0]
+                elif isinstance(output, str):
+                    result_url = output
+                else:
+                    return None
+
+                import httpx
+                http_client = httpx.Client(timeout=120)
+                resp = http_client.get(result_url)
+                if resp.status_code == 200:
+                    return Image.open(io.BytesIO(resp.content)).convert("RGB")
+                logger.error(f"Replicate returned HTTP {resp.status_code} for {replicate_model_id}")
+                return None
+
+            result = await asyncio.to_thread(_call_replicate)
+            if result is not None:
+                logger.info(f"Replicate inference succeeded for {model_name} via {provider}")
+            return result
+        except Exception as e:
+            logger.warning(f"Replicate inference failed for {model_name} via {provider}: {e}")
+            return None
+
+    # Use HF InferenceClient for wavespeed, fal-ai, etc.
     if not hf_token:
         logger.warning(f"No HF token available for model {model_name}")
         return None
 
     try:
+        from huggingface_hub import InferenceClient
+
         current_client = InferenceClient(
             provider=provider,
             api_key=hf_token,
@@ -168,9 +251,11 @@ async def _generate_inpainting_preview(
     image_path: str,
     regions: List[RegionConfig],
     hf_token: str,
+    replicate_token: str = None,
 ) -> dict:
     """Generate an inpainting preview using huggingface_hub.InferenceClient."""
     from PIL import ImageChops
+    import numpy as np
 
     material_groups: dict = {}
     for region in regions:
@@ -237,20 +322,23 @@ async def _generate_inpainting_preview(
             generated = await _generate_material_image(
                 current_image, prompt, model_name,
                 provider=provider, hf_token=hf_token, mask=dilated_mask,
+                replicate_token=replicate_token,
             )
 
             if generated is not None:
                 # Verify the model actually changed something — some providers
-                # silently ignore the mask and return an identical image.
-                diff = ImageChops.difference(
-                    current_image.resize(generated.size),
-                    generated,
-                )
-                diff_bbox = diff.getbbox()
-                if diff_bbox is None:
+                # silently ignore the mask and return an identical or near-identical
+                # image. Compute the average pixel difference as a percentage.
+                resized_current = current_image.resize(generated.size)
+                diff = ImageChops.difference(resized_current, generated)
+                diff_array = np.array(diff.convert("L"))
+                avg_diff_pct = (diff_array.mean() / 255.0) * 100.0
+
+                if avg_diff_pct < 1.0:
                     logger.warning(
-                        f"Model {model_name} via {provider} returned an identical image "
-                        f"(mask may have been ignored). Trying next model."
+                        f"Model {model_name} via {provider} returned a near-identical image "
+                        f"(avg diff: {avg_diff_pct:.2f}%). Mask may have been ignored. "
+                        f"Trying next model."
                     )
                     continue
 
@@ -259,7 +347,10 @@ async def _generate_inpainting_preview(
                     outputs_dir, f"debug_diff_{material}_{provider}.png"
                 )
                 diff.save(debug_diff_path, "PNG")
-                logger.info(f"Saved debug difference to {debug_diff_path}")
+                logger.info(
+                    f"Saved debug difference to {debug_diff_path} "
+                    f"(avg diff: {avg_diff_pct:.2f}%)"
+                )
 
                 current_image = generated
                 logger.info(f"Successfully applied material '{material}' to {len(group_regions)} regions")
@@ -491,15 +582,18 @@ async def generate_preview(
         f"image={os.path.basename(local_path)}"
     )
 
+    replicate_token = settings.replicate_api_token
     try:
-        result = await _generate_inpainting_preview(local_path, valid_regions, hf_token)
+        result = await _generate_inpainting_preview(
+            local_path, valid_regions, hf_token,
+            replicate_token=replicate_token,
+        )
         if result.get("success"):
             logger.info("generate_preview: HuggingFace InferenceClient succeeded")
             return result
     except Exception as e:
         logger.warning(f"generate_preview: HuggingFace InferenceClient failed: {e}")
 
-    replicate_token = settings.replicate_api_token
     if replicate_token and replicate_token != "your-replicate-api-token":
         try:
             result = await _generate_replicate_preview(local_path, valid_regions, replicate_token)

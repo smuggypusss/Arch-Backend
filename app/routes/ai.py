@@ -68,10 +68,10 @@ NEGATIVE_PROMPT = (
 def _build_material_prompt(region_type: str, material: str) -> str:
     region_desc = REGION_PROMPT_MAP.get(region_type, region_type)
     return (
-        f"An ultra-photorealistic, high-end professional architectural photograph of building exterior {region_desc} "
-        f"renovated with premium, beautifully textured {material}. "
-        f"Seamless design integration, realistic texture detailing, crisp material seams, and natural shadows. "
-        f"8k resolution, modern facade design, perfect daylight lighting, crisp detail, realistic depth."
+        f"Replace ONLY the {region_desc} with premium, beautifully textured {material}. "
+        f"Do not preserve the existing texture. Do not change windows, doors, roof, sky, or any other area outside the mask. "
+        f"Photorealistic exterior architectural material replacement, realistic texture detailing, "
+        f"natural lighting, consistent perspective, seamless blend with surroundings, 8k detail."
     )
 
 
@@ -142,14 +142,17 @@ async def _generate_material_image(
     model_name: str,
     hf_token: str = None,
     client=None,
+    mask: Image.Image = None,
 ) -> Optional[Image.Image]:
-    """Generate a modified image using image-to-image.
+    """Generate a modified image using inpainting or image-to-image.
 
-    First tries local inference with diffusers DiffusionPipeline
-    (for microsoft/Mage-Flow-Edit-Turbo), then falls back to
-    HuggingFace InferenceClient. The result preserves the original
-    structure, perspective, and lighting while changing only the
-    materials as described in the prompt.
+    When a mask is provided, uses client.inpainting() which only modifies
+    the masked area — this is the correct approach for material replacement.
+    Falls back to client.image_to_image() (which modifies the entire image)
+    only when no mask is available.
+
+    The result preserves the original structure, perspective, and lighting
+    while changing only the materials as described in the prompt.
     """
     import asyncio
 
@@ -159,12 +162,21 @@ async def _generate_material_image(
         if pipe is not None:
             def _call_diffusers():
                 try:
-                    result = pipe(
-                        image=image,
-                        prompt=prompt,
-                        num_inference_steps=30,
-                        guidance_scale=7.5,
-                    )
+                    if mask is not None:
+                        result = pipe(
+                            image=image,
+                            mask_image=mask,
+                            prompt=prompt,
+                            num_inference_steps=30,
+                            guidance_scale=7.5,
+                        )
+                    else:
+                        result = pipe(
+                            image=image,
+                            prompt=prompt,
+                            num_inference_steps=30,
+                            guidance_scale=7.5,
+                        )
                     if hasattr(result, "images") and result.images:
                         return result.images[0]
                     elif isinstance(result, list) and len(result) > 0:
@@ -191,6 +203,30 @@ async def _generate_material_image(
     if client is None:
         logger.warning(f"No client or token available for model {model_name}")
         return None
+
+    # When a mask is provided, use inpainting — this only modifies the
+    # masked area, which is exactly what we want for material replacement.
+    if mask is not None and hasattr(client, "inpainting"):
+        def _call_inpainting():
+            try:
+                return client.inpainting(
+                    image=image,
+                    mask=mask,
+                    prompt=prompt,
+                    negative_prompt=NEGATIVE_PROMPT,
+                    guidance_scale=7.5,
+                    num_inference_steps=30,
+                )
+            except StopIteration:
+                raise RuntimeError("StopIteration raised by inpainting")
+
+        try:
+            result = await asyncio.to_thread(_call_inpainting)
+            logger.info(f"Inpainting succeeded for {model_name}")
+            return result
+        except Exception as e:
+            logger.warning(f"Inpainting failed for {model_name}: {e}")
+            # Fall through to image_to_image as last resort
 
     def _call_image_to_image():
         try:
@@ -269,15 +305,24 @@ async def _generate_inpainting_preview(
         prompt = _build_material_prompt(region.type, region.selected_material)
         logger.info(f"Generating material for region '{region.type}' with '{region.selected_material}'")
 
-        # Try each image-to-image model in order.
-        # _generate_material_image returns None on failure (exceptions are
-        # caught internally), so we track success via the return value.
+        # Try each model in order.
+        # When a mask is provided, _generate_material_image uses inpainting
+        # which only modifies the masked area — so the result can be used
+        # directly without compositing. If inpainting is unavailable, it
+        # falls back to image_to_image + compositing.
         region_success = False
         for model_name in T2I_MODELS:
-            generated = await _generate_material_image(current_image, prompt, model_name, hf_token=hf_token, client=client)
+            generated = await _generate_material_image(
+                current_image, prompt, model_name,
+                hf_token=hf_token, client=client, mask=mask_image,
+            )
 
             if generated is not None:
-                # Composite the generated material onto the current image
+                # Composite the generated material onto the current image using
+                # the mask. When inpainting is used, the result already has only
+                # the masked area modified, so compositing is a safe no-op for
+                # the unchanged areas. When image_to_image is used as a fallback,
+                # compositing ensures only the masked region is replaced.
                 current_image = _composite_region(current_image, generated, mask_image)
                 logger.info(f"Successfully applied material for region '{region.type}' with model {model_name}")
                 region_success = True

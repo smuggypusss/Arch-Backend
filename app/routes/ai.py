@@ -55,6 +55,8 @@ REGION_PROMPT_MAP = {
 # Models for material editing/inpainting.
 # Note: FLUX.1-Fill-dev is specifically optimized for mask-based inpainting.
 MODELS = [
+    ("replicate", "black-forest-labs/FLUX.1-Kontext-dev"),
+    ("replicate", "Qwen/Qwen-Image-Edit"),
     ("wavespeed", "black-forest-labs/FLUX.1-Kontext-dev"),
     ("fal-ai", "Qwen/Qwen-Image-Edit"),
 ]
@@ -69,15 +71,14 @@ NEGATIVE_PROMPT = (
 def _build_material_prompt(region_type: str, material: str) -> str:
     region_desc = REGION_PROMPT_MAP.get(region_type, region_type)
     return (
-        f"Architectural facade rendering. "
-        f"The white masked region is an existing {region_desc} with plain cement plaster. "
-        f"Completely replace the {region_desc} surface with {material}. "
-        f"The original plaster texture must disappear completely. "
-        f"The new surface must clearly consist of realistic {material} "
+        f"Replace ONLY the masked {region_desc} with {material}. "
+        f"Transform the white painted {region_desc} into realistic {material} "
         f"with visible texture and mortar joints. "
-        f"Do not alter: windows, roof, doors, wall shape, perspective, "
-        f"shadows, lighting. "
-        f"Only replace the {region_desc} material. "
+        f"The change must be clearly visible. "
+        f"Keep the glass unchanged. "
+        f"Keep the building geometry identical. "
+        f"Do not modify any unmasked pixels. "
+        f"Ignore everything outside the mask. "
         f"Ultra realistic architecture photo, 8k detail."
     )
 
@@ -218,6 +219,11 @@ async def _generate_inpainting_preview(
 
         dilated_mask = _dilate_mask(merged_mask, kernel_size=15)
 
+        # Save debug mask for inspection
+        debug_mask_path = os.path.join(outputs_dir, f"debug_mask_{material}.png")
+        dilated_mask.save(debug_mask_path, "PNG")
+        logger.info(f"Saved debug mask to {debug_mask_path}")
+
         primary_type = sorted(region_types)[0]
         region_desc = REGION_PROMPT_MAP.get(primary_type, primary_type)
         prompt = _build_material_prompt(region_desc, material)
@@ -234,6 +240,27 @@ async def _generate_inpainting_preview(
             )
 
             if generated is not None:
+                # Verify the model actually changed something — some providers
+                # silently ignore the mask and return an identical image.
+                diff = ImageChops.difference(
+                    current_image.resize(generated.size),
+                    generated,
+                )
+                diff_bbox = diff.getbbox()
+                if diff_bbox is None:
+                    logger.warning(
+                        f"Model {model_name} via {provider} returned an identical image "
+                        f"(mask may have been ignored). Trying next model."
+                    )
+                    continue
+
+                # Save debug difference image
+                debug_diff_path = os.path.join(
+                    outputs_dir, f"debug_diff_{material}_{provider}.png"
+                )
+                diff.save(debug_diff_path, "PNG")
+                logger.info(f"Saved debug difference to {debug_diff_path}")
+
                 current_image = generated
                 logger.info(f"Successfully applied material '{material}' to {len(group_regions)} regions")
                 region_success = True

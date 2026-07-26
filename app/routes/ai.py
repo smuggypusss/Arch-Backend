@@ -135,12 +135,15 @@ async def _generate_material_image(
         logger.warning(f"No client or token available for model {model_name}")
         return None
 
-    # Use inpainting — FLUX Fill is designed for mask-based inpainting
-    # and only modifies the masked area.
-    if mask is not None and hasattr(client, "inpainting"):
-        def _call_inpainting():
+    # Use image_to_image with mask — this is the HF Inference API method
+    # for mask-based inpainting. The InferenceClient exposes this as
+    # image_to_image(image, mask, prompt, model=...) which only modifies
+    # the masked area. (The dedicated inpainting() method is not always
+    # available depending on the huggingface_hub version and provider.)
+    if mask is not None:
+        def _call_image_to_image_with_mask():
             try:
-                return client.inpainting(
+                return client.image_to_image(
                     image=image,
                     mask=mask,
                     prompt=prompt,
@@ -150,14 +153,14 @@ async def _generate_material_image(
                     model=model_name,
                 )
             except StopIteration:
-                raise RuntimeError("StopIteration raised by inpainting")
+                raise RuntimeError("StopIteration raised by image_to_image with mask")
 
         try:
-            result = await asyncio.to_thread(_call_inpainting)
-            logger.info(f"Inpainting succeeded for {model_name}")
+            result = await asyncio.to_thread(_call_image_to_image_with_mask)
+            logger.info(f"Image-to-image with mask succeeded for {model_name}")
             return result
         except Exception as e:
-            logger.warning(f"Inpainting failed for {model_name}: {e}")
+            logger.warning(f"Image-to-image with mask failed for {model_name}: {e}")
             return None
 
     logger.warning(f"No mask provided for model {model_name}")

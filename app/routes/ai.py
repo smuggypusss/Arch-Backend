@@ -52,10 +52,12 @@ REGION_PROMPT_MAP = {
     "door": "front door",
 }
 
-# Models to try for image-to-image generation (used for material synthesis).
-# These models support the image-to-image task on HuggingFace Inference API.
+# Models to try for material editing (used for material synthesis).
+# FLUX.1-Fill-dev is specifically designed for mask-based inpainting and
+# object replacement. It is available via the Hugging Face Inference API
+# (unlike Mage-Flow-Edit which is local Diffusers only).
 T2I_MODELS = [
-    "black-forest-labs/FLUX.1-Kontext-dev",
+    "black-forest-labs/FLUX.1-Fill-dev",
 ]
 
 NEGATIVE_PROMPT = (
@@ -68,10 +70,16 @@ NEGATIVE_PROMPT = (
 def _build_material_prompt(region_type: str, material: str) -> str:
     region_desc = REGION_PROMPT_MAP.get(region_type, region_type)
     return (
-        f"Replace ONLY the {region_desc} with premium, beautifully textured {material}. "
-        f"Do not preserve the existing texture. Do not change windows, doors, roof, sky, or any other area outside the mask. "
-        f"Photorealistic exterior architectural material replacement, realistic texture detailing, "
-        f"natural lighting, consistent perspective, seamless blend with surroundings, 8k detail."
+        f"Architectural facade rendering. "
+        f"The white masked region is an existing {region_desc} with plain cement plaster. "
+        f"Completely replace the {region_desc} surface with {material}. "
+        f"The original plaster texture must disappear completely. "
+        f"The new surface must clearly consist of realistic {material} "
+        f"with visible texture and mortar joints. "
+        f"Do not alter: windows, roof, doors, wall shape, perspective, "
+        f"shadows, lighting. "
+        f"Only replace the {region_desc} material. "
+        f"Ultra realistic architecture photo, 8k detail."
     )
 
 
@@ -85,55 +93,20 @@ def _load_mask(path: str) -> Image.Image:
     return mask
 
 
-def _composite_region(original: Image.Image, generated: Image.Image, mask: Image.Image) -> Image.Image:
-    """Composite a generated material image onto the original using a mask.
+def _dilate_mask(mask: Image.Image, kernel_size: int = 5) -> Image.Image:
+    """Dilate a binary mask to avoid seams where old material shows through.
 
-    The mask defines which pixels to replace (white = replace, black = keep).
-    The generated image is resized to match the original and blended using
-    a soft mask to avoid hard edges.
+    Uses cv2.dilate with a square kernel. A 5x5 kernel expands the mask
+    slightly so that the AI has enough context to fully cover the original
+    surface, preventing thin edges of the old material from bleeding through.
     """
-    # Resize generated image to match original
-    gen_resized = generated.resize(original.size, Image.LANCZOS)
+    import numpy as np
+    import cv2
 
-    # Apply Gaussian blur to the mask for soft edges
-    mask_blurred = mask.filter(ImageFilter.GaussianBlur(radius=3))
-
-    # Composite: where mask is white, use generated; where black, use original
-    result = Image.composite(gen_resized, original, mask_blurred)
-    return result
-
-
-# Module-level cache for the Mage-Flow-Edit-Turbo pipeline (local inference)
-_mage_pipe = None
-
-
-def _get_mage_pipe(hf_token: str):
-    """Load and cache the microsoft/Mage-Flow-Edit-Turbo DiffusionPipeline.
-
-    Returns the cached pipeline if already loaded, or None if loading fails.
-    The pipeline is loaded once and reused across all generation calls to
-    avoid the overhead of re-downloading model weights.
-    """
-    global _mage_pipe
-    if _mage_pipe is not None:
-        return _mage_pipe
-
-    try:
-        import torch
-        from diffusers import DiffusionPipeline
-
-        logger.info("_get_mage_pipe: loading microsoft/Mage-Flow-Edit-Turbo...")
-        _mage_pipe = DiffusionPipeline.from_pretrained(
-            "microsoft/Mage-Flow-Edit-Turbo",
-            torch_dtype=torch.float32,
-            token=hf_token,
-        )
-        logger.info("_get_mage_pipe: pipeline loaded successfully")
-        return _mage_pipe
-    except Exception as e:
-        logger.warning(f"_get_mage_pipe: failed to load pipeline: {e}")
-        _mage_pipe = None
-        return None
+    mask_array = np.array(mask)
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    dilated = cv2.dilate(mask_array, kernel, iterations=1)
+    return Image.fromarray(dilated)
 
 
 async def _generate_material_image(
@@ -144,58 +117,16 @@ async def _generate_material_image(
     client=None,
     mask: Image.Image = None,
 ) -> Optional[Image.Image]:
-    """Generate a modified image using inpainting or image-to-image.
+    """Generate a modified image using inpainting.
 
-    When a mask is provided, uses client.inpainting() which only modifies
-    the masked area — this is the correct approach for material replacement.
-    Falls back to client.image_to_image() (which modifies the entire image)
-    only when no mask is available.
-
-    The result preserves the original structure, perspective, and lighting
-    while changing only the materials as described in the prompt.
+    Uses client.inpainting() which only modifies the masked area —
+    this is the correct approach for material replacement with FLUX Fill.
+    No fallback to image_to_image is used, as that endpoint may ignore
+    the mask and produce inconsistent results.
     """
     import asyncio
 
-    # --- Local diffusers inference (primary method) ---
-    if model_name == "microsoft/Mage-Flow-Edit-Turbo":
-        pipe = _get_mage_pipe(hf_token) if hf_token else None
-        if pipe is not None:
-            def _call_diffusers():
-                try:
-                    if mask is not None:
-                        result = pipe(
-                            image=image,
-                            mask_image=mask,
-                            prompt=prompt,
-                            num_inference_steps=30,
-                            guidance_scale=7.5,
-                        )
-                    else:
-                        result = pipe(
-                            image=image,
-                            prompt=prompt,
-                            num_inference_steps=30,
-                            guidance_scale=7.5,
-                        )
-                    if hasattr(result, "images") and result.images:
-                        return result.images[0]
-                    elif isinstance(result, list) and len(result) > 0:
-                        return result[0]
-                    return result
-                except StopIteration:
-                    raise RuntimeError("StopIteration raised by diffusers pipeline")
-
-            try:
-                generated = await asyncio.to_thread(_call_diffusers)
-                if generated is not None:
-                    logger.info(f"Local diffusers inference succeeded for {model_name}")
-                    return generated
-            except Exception as e:
-                logger.warning(f"Local diffusers inference failed for {model_name}: {e}")
-                # Reset cached pipe so it can be retried on next call
-                _mage_pipe = None
-
-    # --- Fallback: HuggingFace InferenceClient ---
+    # Create the InferenceClient if not provided
     if client is None and hf_token:
         from huggingface_hub import InferenceClient
         client = InferenceClient(provider="fal-ai", api_key=hf_token, timeout=180)
@@ -204,8 +135,8 @@ async def _generate_material_image(
         logger.warning(f"No client or token available for model {model_name}")
         return None
 
-    # When a mask is provided, use inpainting — this only modifies the
-    # masked area, which is exactly what we want for material replacement.
+    # Use inpainting — FLUX Fill is designed for mask-based inpainting
+    # and only modifies the masked area.
     if mask is not None and hasattr(client, "inpainting"):
         def _call_inpainting():
             try:
@@ -214,8 +145,9 @@ async def _generate_material_image(
                     mask=mask,
                     prompt=prompt,
                     negative_prompt=NEGATIVE_PROMPT,
-                    guidance_scale=7.5,
-                    num_inference_steps=30,
+                    guidance_scale=10.0,
+                    num_inference_steps=45,
+                    model=model_name,
                 )
             except StopIteration:
                 raise RuntimeError("StopIteration raised by inpainting")
@@ -226,29 +158,10 @@ async def _generate_material_image(
             return result
         except Exception as e:
             logger.warning(f"Inpainting failed for {model_name}: {e}")
-            # Fall through to image_to_image as last resort
+            return None
 
-    def _call_image_to_image():
-        try:
-            return client.image_to_image(
-                image=image,
-                prompt=prompt,
-                model=model_name,
-                guidance_scale=7.5,
-                num_inference_steps=30,
-            )
-        except StopIteration:
-            # StopIteration can be raised by generators inside the HuggingFace
-            # client when used with asyncio.to_thread. Convert to RuntimeError
-            # so it doesn't break the asyncio event loop.
-            raise RuntimeError("StopIteration raised by image_to_image")
-
-    try:
-        result = await asyncio.to_thread(_call_image_to_image)
-        return result
-    except Exception as e:
-        logger.warning(f"Model {model_name} failed: {e}")
-        return None
+    logger.warning(f"No mask provided for model {model_name}")
+    return None
 
 
 async def _generate_inpainting_preview(
@@ -258,24 +171,38 @@ async def _generate_inpainting_preview(
 ) -> dict:
     """Generate an inpainting preview using huggingface_hub.InferenceClient.
 
-    For each region, a binary mask is generated from the polygon. The current
-    image is modified using image_to_image with a prompt describing the desired
-    material, then composited back onto the original using the mask. This
-    preserves the original geometry, lighting, and perspective while changing
-    only the masked materials.
+    Regions are grouped by material. For each material group, all region masks
+    are merged into a single mask, and a single inpainting inference is performed.
+    This avoids the drift that occurs when generating each wall separately —
+    each inference introduces new noise, and by the fourth wall the AI has
+    drifted completely. Professional renovation visualizers always merge masks
+    and do one inference per material.
     """
     from huggingface_hub import InferenceClient
-    from PIL import ImageFilter
+    from PIL import ImageChops
 
-    # Sort regions by polygon vertex count (proxy for area)
-    sorted_regions = sorted(regions, key=lambda r: len(r.polygon), reverse=True)
+    # Group regions by material — one inference per material, not per wall
+    material_groups: dict = {}
+    for region in regions:
+        if not region.polygon or len(region.polygon) < 3:
+            logger.warning(f"Skipping region {region.type}: no valid polygon")
+            continue
+        key = region.selected_material
+        if key not in material_groups:
+            material_groups[key] = []
+        material_groups[key].append(region)
+
+    if not material_groups:
+        return {
+            "success": False,
+            "error": "No valid regions with materials and polygons provided",
+        }
 
     # Load the original image
     original_image = _load_image(image_path)
     current_image = original_image
 
-    # Create the InferenceClient once and reuse.
-    # Use fal-ai provider as configured for black-forest-labs/FLUX.1-Kontext-dev
+    # Create the InferenceClient once and reuse
     client = InferenceClient(
         provider="fal-ai",
         api_key=hf_token,
@@ -288,54 +215,64 @@ async def _generate_inpainting_preview(
     regions_succeeded = 0
     regions_failed = 0
 
-    for region in sorted_regions:
-        if not region.polygon or len(region.polygon) < 3:
-            logger.warning(f"Skipping region {region.type}: no valid polygon")
-            regions_failed += 1
+    for material, group_regions in material_groups.items():
+        # Merge all masks for this material into a single mask.
+        # ImageChops.lighter does a per-pixel max, so any white pixel
+        # in any mask becomes white in the merged mask.
+        merged_mask = None
+        region_types = set()
+        for region in group_regions:
+            mask_path = generate_mask_for_region(
+                image_path=image_path,
+                region_polygon=region.polygon,
+                region_id=f"merged_{material}_{id(region)}",
+            )
+            mask_image = _load_mask(mask_path)
+            if merged_mask is None:
+                merged_mask = mask_image
+            else:
+                merged_mask = ImageChops.lighter(merged_mask, mask_image)
+            region_types.add(region.type)
+
+        if merged_mask is None:
+            regions_failed += len(group_regions)
             continue
 
-        # Generate mask from polygon
-        mask_path = generate_mask_for_region(
-            image_path=image_path,
-            region_polygon=region.polygon,
-            region_id=f"preview_{region.type}_{id(region)}",
+        # Dilate the merged mask to avoid seams where old material shows through
+        dilated_mask = _dilate_mask(merged_mask, kernel_size=15)
+
+        # Build prompt for this material group
+        primary_type = sorted(region_types)[0]
+        region_desc = REGION_PROMPT_MAP.get(primary_type, primary_type)
+        prompt = _build_material_prompt(region_desc, material)
+        logger.info(
+            f"Generating material '{material}' for {len(group_regions)} regions "
+            f"(types: {', '.join(sorted(region_types))})"
         )
-        mask_image = _load_mask(mask_path)
 
-        prompt = _build_material_prompt(region.type, region.selected_material)
-        logger.info(f"Generating material for region '{region.type}' with '{region.selected_material}'")
-
-        # Try each model in order.
-        # When a mask is provided, _generate_material_image uses inpainting
-        # which only modifies the masked area — so the result can be used
-        # directly without compositing. If inpainting is unavailable, it
-        # falls back to image_to_image + compositing.
+        # Try each model in order
         region_success = False
         for model_name in T2I_MODELS:
             generated = await _generate_material_image(
                 current_image, prompt, model_name,
-                hf_token=hf_token, client=client, mask=mask_image,
+                hf_token=hf_token, client=client, mask=dilated_mask,
             )
 
             if generated is not None:
-                # Composite the generated material onto the current image using
-                # the mask. When inpainting is used, the result already has only
-                # the masked area modified, so compositing is a safe no-op for
-                # the unchanged areas. When image_to_image is used as a fallback,
-                # compositing ensures only the masked region is replaced.
-                current_image = _composite_region(current_image, generated, mask_image)
-                logger.info(f"Successfully applied material for region '{region.type}' with model {model_name}")
+                # FLUX Fill inpainting returns the entire image with only the
+                # masked area modified. Use it directly — the model preserves
+                # the outside perfectly, so no compositing is needed.
+                current_image = generated
+                logger.info(f"Successfully applied material '{material}' to {len(group_regions)} regions")
                 region_success = True
+                regions_succeeded += len(group_regions)
                 break
 
-        if region_success:
-            regions_succeeded += 1
-        else:
-            regions_failed += 1
-            logger.error(f"All models failed for region '{region.type}'")
+        if not region_success:
+            regions_failed += len(group_regions)
+            logger.error(f"All models failed for material '{material}'")
 
-    # Only return success if at least one region was actually modified.
-    # Returning success with the unmodified original image is misleading.
+    # Only return success if at least one region was actually modified
     if regions_succeeded == 0:
         logger.error(
             f"generate_preview: all {regions_failed} regions failed to generate materials"

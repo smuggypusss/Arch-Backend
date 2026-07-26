@@ -52,12 +52,11 @@ REGION_PROMPT_MAP = {
     "door": "front door",
 }
 
-# Models to try for material editing (used for material synthesis).
-# FLUX.1-Fill-dev is specifically designed for mask-based inpainting and
-# object replacement. It is available via the Hugging Face Inference API
-# (unlike Mage-Flow-Edit which is local Diffusers only).
-T2I_MODELS = [
-    "black-forest-labs/FLUX.1-Fill-dev",
+# Models for material editing/inpainting.
+# Note: FLUX.1-Fill-dev is specifically optimized for mask-based inpainting.
+MODELS = [
+    ("wavespeed", "black-forest-labs/FLUX.1-Kontext-dev"),
+    ("fal-ai", "Qwen/Qwen-Image-Edit"),
 ]
 
 NEGATIVE_PROMPT = (
@@ -94,12 +93,7 @@ def _load_mask(path: str) -> Image.Image:
 
 
 def _dilate_mask(mask: Image.Image, kernel_size: int = 5) -> Image.Image:
-    """Dilate a binary mask to avoid seams where old material shows through.
-
-    Uses cv2.dilate with a square kernel. A 5x5 kernel expands the mask
-    slightly so that the AI has enough context to fully cover the original
-    surface, preventing thin edges of the old material from bleeding through.
-    """
+    """Dilate a binary mask to avoid seams where old material shows through."""
     import numpy as np
     import cv2
 
@@ -113,39 +107,45 @@ async def _generate_material_image(
     image: Image.Image,
     prompt: str,
     model_name: str,
+    provider: str,
     hf_token: str = None,
-    client=None,
     mask: Image.Image = None,
 ) -> Optional[Image.Image]:
-    """Generate a modified image using inpainting.
-
-    Uses client.inpainting() which only modifies the masked area —
-    this is the correct approach for material replacement with FLUX Fill.
-    No fallback to image_to_image is used, as that endpoint may ignore
-    the mask and produce inconsistent results.
-    """
+    """Generate a modified image using image_to_image with mask."""
     import asyncio
+    from huggingface_hub import InferenceClient
 
-    # Create the InferenceClient if not provided
-    if client is None and hf_token:
-        from huggingface_hub import InferenceClient
-        client = InferenceClient(provider="fal-ai", api_key=hf_token, timeout=180)
-
-    if client is None:
-        logger.warning(f"No client or token available for model {model_name}")
+    if mask is None:
+        logger.warning(f"No mask provided for model {model_name}")
         return None
 
-    # Use image_to_image with mask — this is the HF Inference API method
-    # for mask-based inpainting. The InferenceClient exposes this as
-    # image_to_image(image, mask, prompt, model=...) which only modifies
-    # the masked area. (The dedicated inpainting() method is not always
-    # available depending on the huggingface_hub version and provider.)
-    if mask is not None:
+    if not hf_token:
+        logger.warning(f"No HF token available for model {model_name}")
+        return None
+
+    try:
+        current_client = InferenceClient(
+            provider=provider,
+            api_key=hf_token,
+            timeout=180,
+        )
+
         def _call_image_to_image_with_mask():
             try:
-                return client.image_to_image(
-                    image=image,
-                    mask=mask,
+                # Convert source image to bytes
+                img_buffer = io.BytesIO()
+                image.save(img_buffer, format="PNG")
+                img_bytes = img_buffer.getvalue()
+
+                # Convert mask to base64 Data URI string so kwargs can be JSON-serialized
+                mask_buffer = io.BytesIO()
+                mask.save(mask_buffer, format="PNG")
+                mask_b64 = base64.b64encode(mask_buffer.getvalue()).decode("utf-8")
+                mask_data_uri = f"data:image/png;base64,{mask_b64}"
+
+                return current_client.image_to_image(
+                    image=img_bytes,
+                    mask=mask_data_uri,
                     prompt=prompt,
                     negative_prompt=NEGATIVE_PROMPT,
                     guidance_scale=10.0,
@@ -155,16 +155,12 @@ async def _generate_material_image(
             except StopIteration:
                 raise RuntimeError("StopIteration raised by image_to_image with mask")
 
-        try:
-            result = await asyncio.to_thread(_call_image_to_image_with_mask)
-            logger.info(f"Image-to-image with mask succeeded for {model_name}")
-            return result
-        except Exception as e:
-            logger.warning(f"Image-to-image with mask failed for {model_name}: {e}")
-            return None
-
-    logger.warning(f"No mask provided for model {model_name}")
-    return None
+        result = await asyncio.to_thread(_call_image_to_image_with_mask)
+        logger.info(f"Image-to-image with mask succeeded for {model_name} via {provider}")
+        return result
+    except Exception as e:
+        logger.warning(f"Image-to-image with mask failed for {model_name} via {provider}: {e}")
+        return None
 
 
 async def _generate_inpainting_preview(
@@ -172,19 +168,9 @@ async def _generate_inpainting_preview(
     regions: List[RegionConfig],
     hf_token: str,
 ) -> dict:
-    """Generate an inpainting preview using huggingface_hub.InferenceClient.
-
-    Regions are grouped by material. For each material group, all region masks
-    are merged into a single mask, and a single inpainting inference is performed.
-    This avoids the drift that occurs when generating each wall separately —
-    each inference introduces new noise, and by the fourth wall the AI has
-    drifted completely. Professional renovation visualizers always merge masks
-    and do one inference per material.
-    """
-    from huggingface_hub import InferenceClient
+    """Generate an inpainting preview using huggingface_hub.InferenceClient."""
     from PIL import ImageChops
 
-    # Group regions by material — one inference per material, not per wall
     material_groups: dict = {}
     for region in regions:
         if not region.polygon or len(region.polygon) < 3:
@@ -201,16 +187,8 @@ async def _generate_inpainting_preview(
             "error": "No valid regions with materials and polygons provided",
         }
 
-    # Load the original image
     original_image = _load_image(image_path)
     current_image = original_image
-
-    # Create the InferenceClient once and reuse
-    client = InferenceClient(
-        provider="fal-ai",
-        api_key=hf_token,
-        timeout=180,
-    )
 
     outputs_dir = os.path.abspath(settings.output_dir)
     os.makedirs(outputs_dir, exist_ok=True)
@@ -219,9 +197,6 @@ async def _generate_inpainting_preview(
     regions_failed = 0
 
     for material, group_regions in material_groups.items():
-        # Merge all masks for this material into a single mask.
-        # ImageChops.lighter does a per-pixel max, so any white pixel
-        # in any mask becomes white in the merged mask.
         merged_mask = None
         region_types = set()
         for region in group_regions:
@@ -241,10 +216,8 @@ async def _generate_inpainting_preview(
             regions_failed += len(group_regions)
             continue
 
-        # Dilate the merged mask to avoid seams where old material shows through
         dilated_mask = _dilate_mask(merged_mask, kernel_size=15)
 
-        # Build prompt for this material group
         primary_type = sorted(region_types)[0]
         region_desc = REGION_PROMPT_MAP.get(primary_type, primary_type)
         prompt = _build_material_prompt(region_desc, material)
@@ -253,18 +226,14 @@ async def _generate_inpainting_preview(
             f"(types: {', '.join(sorted(region_types))})"
         )
 
-        # Try each model in order
         region_success = False
-        for model_name in T2I_MODELS:
+        for provider, model_name in MODELS:
             generated = await _generate_material_image(
                 current_image, prompt, model_name,
-                hf_token=hf_token, client=client, mask=dilated_mask,
+                provider=provider, hf_token=hf_token, mask=dilated_mask,
             )
 
             if generated is not None:
-                # FLUX Fill inpainting returns the entire image with only the
-                # masked area modified. Use it directly — the model preserves
-                # the outside perfectly, so no compositing is needed.
                 current_image = generated
                 logger.info(f"Successfully applied material '{material}' to {len(group_regions)} regions")
                 region_success = True
@@ -275,11 +244,8 @@ async def _generate_inpainting_preview(
             regions_failed += len(group_regions)
             logger.error(f"All models failed for material '{material}'")
 
-    # Only return success if at least one region was actually modified
     if regions_succeeded == 0:
-        logger.error(
-            f"generate_preview: all {regions_failed} regions failed to generate materials"
-        )
+        logger.error(f"generate_preview: all {regions_failed} regions failed to generate materials")
         return {
             "success": False,
             "error": (
@@ -288,7 +254,6 @@ async def _generate_inpainting_preview(
             ),
         }
 
-    # Save the final result
     output_filename = f"ai_preview_{os.path.basename(image_path)}"
     output_path = os.path.join(outputs_dir, output_filename)
     current_image.save(output_path, "PNG")
@@ -333,7 +298,6 @@ async def _generate_replicate_preview(
             region_id=f"replicate_{region.type}_{id(region)}",
         )
 
-        # Convert images to base64 for Replicate
         img_buffer = io.BytesIO()
         current_image.save(img_buffer, format="PNG")
         img_b64 = base64.b64encode(img_buffer.getvalue()).decode("utf-8")
@@ -362,7 +326,6 @@ async def _generate_replicate_preview(
             )
             result_url = output[0] if isinstance(output, list) and len(output) > 0 else output
 
-            # Download the result
             import httpx
             async with httpx.AsyncClient(timeout=120) as http_client:
                 resp = await http_client.get(result_url)
@@ -378,11 +341,8 @@ async def _generate_replicate_preview(
         else:
             regions_failed += 1
 
-    # Only return success if at least one region was actually modified.
     if regions_succeeded == 0:
-        logger.error(
-            f"generate_preview: Replicate fallback - all {regions_failed} regions failed"
-        )
+        logger.error(f"generate_preview: Replicate fallback - all {regions_failed} regions failed")
         return {
             "success": False,
             "error": (
@@ -425,25 +385,17 @@ async def refine_regions_route(
     data: RefineRegionsRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    """Refine existing region polygons using AI detection with user-provided hints.
-
-    The endpoint receives the original image path and a list of regions (each with
-    a polygon), re-runs the AI detection service, and returns refined region polygons.
-    The frontend can then merge the refined polygons with the existing region metadata
-    (IDs, types, materials, notes) to preserve user edits.
-    """
+    """Refine existing region polygons using AI detection with user-provided hints."""
     image_path = data.image_path
     if not image_path:
         raise HTTPException(status_code=400, detail="image_path is required")
 
     logger.info(f"refine_regions: image_path={image_path}, regions={len(data.regions)}")
 
-    # Build the image_url for the detection service
     image_url = image_path if image_path.startswith("/uploads/") else f"/uploads/{image_path}"
     result = await detect_regions_service(image_url)
 
     if result.get("success") and result.get("regions"):
-        # Convert detected regions to polygon format
         refined = []
         for r in result["regions"]:
             polygon = []
@@ -477,13 +429,7 @@ async def generate_preview(
     data: GeneratePreviewRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    """Generate a photorealistic renovation preview using inpainting.
-
-    The endpoint receives the original image path, a list of regions (each with
-    a polygon and selected material), generates binary masks from the polygons,
-    and calls an inpainting model to replace only the masked areas with the
-    specified materials while preserving geometry, lighting, and perspective.
-    """
+    """Generate a photorealistic renovation preview using inpainting."""
     hf_token = settings.hf_api_token or os.environ.get("HF_API_TOKEN", "")
     if not hf_token:
         raise HTTPException(
@@ -491,7 +437,6 @@ async def generate_preview(
             detail="Hugging Face API token not configured. Set HF_API_TOKEN in .env",
         )
 
-    # Resolve the local image path
     uploads_dir = os.path.abspath(settings.upload_dir)
     if data.image_path.startswith("/uploads/"):
         local_path = os.path.join(uploads_dir, data.image_path[len("/uploads/"):])
@@ -503,7 +448,6 @@ async def generate_preview(
     if not os.path.exists(local_path):
         raise HTTPException(status_code=404, detail="Original image not found")
 
-    # Filter regions with valid materials and polygons
     valid_regions = [
         r for r in data.regions
         if r.selected_material and r.polygon and len(r.polygon) >= 3
@@ -520,7 +464,6 @@ async def generate_preview(
         f"image={os.path.basename(local_path)}"
     )
 
-    # Try HuggingFace InferenceClient first (bypasses DNS issues)
     try:
         result = await _generate_inpainting_preview(local_path, valid_regions, hf_token)
         if result.get("success"):
@@ -529,7 +472,6 @@ async def generate_preview(
     except Exception as e:
         logger.warning(f"generate_preview: HuggingFace InferenceClient failed: {e}")
 
-    # Fallback: Replicate
     replicate_token = settings.replicate_api_token
     if replicate_token and replicate_token != "your-replicate-api-token":
         try:

@@ -1,238 +1,175 @@
 import logging
-import ssl
-import replicate
-import httpx
 import os
-from urllib.parse import urlparse
+import replicate
+import asyncio
 from ..config import get_settings
-from ..utils.dns_resolver import (
-    resolve_hostname,
-    resolve_hostname_doh,
-    get_hardcoded_ip,
-    cache_resolved_ip,
-)
 
 settings = get_settings()
 logger = logging.getLogger("e2m.ai")
 
 
-async def _http_post_with_dns_fallback(url, headers, json_data, timeout=60):
-    """Make an HTTP POST request with DNS fallback.
-
-    If the system DNS fails to resolve the hostname (getaddrinfo failed),
-    use the raw DNS resolver to obtain the IP address and retry the request
-    with the IP in the URL while preserving the original Host header.
-    """
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(url, headers=headers, json=json_data)
-            return resp
-    except Exception as e:
-        error_msg = str(e).lower()
-        is_dns_error = (
-            "getaddrinfo" in error_msg
-            or "name or service not known" in error_msg
-            or "errno 11001" in error_msg
-            or "nodename nor servname" in error_msg
-        )
-        if not is_dns_error:
-            raise
-
-        # DNS resolution failed — try raw DNS fallback
-        parsed = urlparse(url)
-        hostname = parsed.hostname
-        if not hostname:
-            raise
-
-        # Try raw UDP DNS first, then fall back to DNS-over-HTTPS
-        ip = resolve_hostname(hostname)
-        if not ip:
-            logger.info("_http_post_with_dns_fallback: raw DNS failed, trying DoH for %s", hostname)
-            ip = await resolve_hostname_doh(hostname)
-
-        # Last resort: hardcoded IP fallback for known endpoints
-        if not ip:
-            logger.info("_http_post_with_dns_fallback: DoH failed, trying hardcoded IP for %s", hostname)
-            ip = get_hardcoded_ip(hostname)
-
-        if not ip:
-            logger.warning("_http_post_with_dns_fallback: all DNS methods could not resolve %s", hostname)
-            raise
-
-        # Cache successful resolution for future use
-        cache_resolved_ip(hostname, ip)
-
-        logger.info("_http_post_with_dns_fallback: DNS fallback resolved %s -> %s", hostname, ip)
-
-        # Build an SSL context that skips hostname verification (we connect
-        # to the IP, not the hostname) while still verifying the certificate
-        # chain when possible.
-        ssl_context = ssl.create_default_context()
-        try:
-            ssl_context.check_hostname = False
-        except (AttributeError, ValueError):
-            pass
-
-        transport = httpx.AsyncHTTPTransport(verify=ssl_context)
-
-        # Replace hostname with IP in the URL
-        new_url = url.replace(f"{parsed.scheme}://{hostname}", f"{parsed.scheme}://{ip}", 1)
-
-        # Preserve the original Host header so the server routes correctly
-        new_headers = {**headers, "Host": hostname}
-
-        async with httpx.AsyncClient(transport=transport, timeout=timeout) as client:
-            resp = await client.post(new_url, headers=new_headers, json=json_data)
-            return resp
-
-
-def _classify_region(rel_y, label, bw, bh, w, h):
+def _classify_region_by_label(label):
+    """Map a segmentation label to a region type."""
     label_lower = (label or "").lower()
-    if "roof" in label_lower or "eave" in label_lower:
-        return "roof"
-    if "window" in label_lower or "trim" in label_lower:
-        return "window"
-    if "balcony" in label_lower or "railing" in label_lower:
-        return "balcony"
-    if "pillar" in label_lower or "column" in label_lower:
-        return "pillar"
-    if "parapet" in label_lower or "terrace" in label_lower:
-        return "parapet"
-    if "gate" in label_lower or "entrance" in label_lower or "door" in label_lower:
+    if "wall" in label_lower:
+        return "wall"
+    if "building" in label_lower:
+        return "wall"  # building maps to wall for renovation purposes
+    if "fence" in label_lower:
         return "gate"
-    if rel_y < 0.15:
-        return "roof"
-    if bw < w * 0.12 and bh > h * 0.15:
-        return "pillar"
-    return "wall"
+    if "vegetation" in label_lower or "tree" in label_lower:
+        return "gate"
+    return None
 
 
 async def _detect_regions_hf(image_path):
-    """Detect regions using huggingface_hub.InferenceClient (bypasses DNS issues)."""
+    """Detect regions using SegFormer semantic segmentation via HF InferenceClient.
+
+    Uses nvidia/segformer-b5-finetuned-cityscapes-1024-1024 through the official
+    HuggingFace InferenceClient SDK (provider="hf-inference").
+
+    Pipeline:
+    1. Run semantic segmentation
+    2. Extract wall/building masks
+    3. Merge masks
+    4. OpenCV cleanup (morphology close/open, remove tiny blobs, fill holes)
+    5. Convert to polygons via cv2.findContours() + cv2.approxPolyDP()
+    """
     hf_token = settings.hf_api_token or os.environ.get("HF_API_TOKEN", "")
     if not hf_token:
         return None
 
     try:
-        from huggingface_hub import InferenceClient
-        import asyncio
-    except ImportError:
-        logger.warning("_detect_regions_hf: huggingface_hub not installed")
-        return None
-
-    try:
         import cv2
+        import numpy as np
         img = cv2.imread(image_path)
         h, w = img.shape[:2] if img is not None else (600, 800)
     except Exception:
         h, w = 600, 800
 
+    # --- SegFormer semantic segmentation via InferenceClient ---
     try:
-        from PIL import Image
-        pil_image = Image.open(image_path).convert("RGB")
-    except Exception as e:
-        logger.error(f"_detect_regions_hf: failed to load image: {e}")
-        return None
-
-    client = InferenceClient(
-        provider="fal-ai",
-        api_key=hf_token,
-        timeout=120,
-    )
-
-    gdino_prompt = "exterior wall. window. roof. balcony. pillar. parapet. door. gate."
-
-    # --- Grounding DINO object detection ---
-    boxes = []
-    labels = []
-    try:
-        detections = await asyncio.to_thread(
-            client.object_detection,
-            image=pil_image,
-            prompt=gdino_prompt,
-            model="facebook/grounding-dino",
-            threshold=0.4,
+        from huggingface_hub import InferenceClient
+        client = InferenceClient(
+            provider="hf-inference",
+            api_key=hf_token,
+            timeout=120,
         )
-        logger.info(f"_detect_regions_hf: Grounding DINO found {len(detections)} detections")
-        for det in detections:
-            score = det.get("score", 0)
-            if score < 0.3:
-                continue
-            label = det.get("label", "")
-            box = det.get("box", {})
-            x1, y1 = box.get("x", 0), box.get("y", 0)
-            x2, y2 = box.get("x2", x1), box.get("y2", y1)
-            if x2 - x1 < 10 or y2 - y1 < 10:
-                continue
-            region_type = _classify_region(y1 / h, label, x2 - x1, y2 - y1, w, h)
-            boxes.append([float(x1), float(y1), float(x2), float(y2)])
-            labels.append(region_type)
-        if not boxes:
-            logger.warning("_detect_regions_hf: no boxes after filtering")
-            return None
-        logger.info(f"_detect_regions_hf: {len(boxes)} boxes after filtering")
+
+        segments = await asyncio.to_thread(
+            client.image_segmentation,
+            image=image_path,
+            model="nvidia/segformer-b5-finetuned-cityscapes-1024-1024",
+            threshold=0.3,
+        )
+        logger.info(f"_detect_regions_hf: SegFormer found {len(segments)} segments")
     except Exception as e:
-        logger.error(f"_detect_regions_hf: Grounding DINO exception: {e}")
+        logger.error(f"_detect_regions_hf: SegFormer exception: {e}")
         return None
 
-    # --- SAM2 segmentation ---
+    # --- Step 2: Extract wall/building masks ---
+    target_labels = {"wall", "building"}
+    wall_masks = []
+    for seg in segments:
+        # Handle both dict and object return types
+        if isinstance(seg, dict):
+            label = seg.get("label", "").lower()
+            mask = seg.get("mask")
+        else:
+            label = getattr(seg, "label", "").lower()
+            mask = getattr(seg, "mask", None)
+
+        if label in target_labels and mask is not None:
+            wall_masks.append(mask)
+
+    if not wall_masks:
+        logger.warning("_detect_regions_hf: no wall/building segments found")
+        return None
+
+    logger.info(f"_detect_regions_hf: found {len(wall_masks)} wall/building masks")
+
+    # --- Step 3: Merge masks ---
+    merged_mask = np.zeros((h, w), dtype=np.uint8)
+    for mask in wall_masks:
+        if hasattr(mask, "convert"):
+            mask_np = np.array(mask.convert("L"))
+        elif isinstance(mask, np.ndarray):
+            mask_np = mask
+        else:
+            mask_np = np.array(mask)
+
+        # Resize mask to match image dimensions
+        if mask_np.shape[:2] != (h, w):
+            mask_np = cv2.resize(mask_np, (w, h))
+
+        # Threshold to binary
+        _, mask_binary = cv2.threshold(mask_np, 127, 255, cv2.THRESH_BINARY)
+        merged_mask = np.maximum(merged_mask, mask_binary)
+
+    # --- Step 4: OpenCV cleanup ---
+    # Fill holes
+    contours, _ = cv2.findContours(merged_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros_like(merged_mask)
+    cv2.fillPoly(filled, contours, 255)
+
+    # Morphology close (fill small gaps)
+    kernel_close = np.ones((15, 15), np.uint8)
+    closed = cv2.morphologyEx(filled, cv2.MORPH_CLOSE, kernel_close)
+
+    # Morphology open (remove small noise)
+    kernel_open = np.ones((5, 5), np.uint8)
+    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel_open)
+
+    # Remove tiny blobs
+    min_area = (w * h) * 0.01  # 1% of image area
+    contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cleaned = np.zeros_like(opened)
+    for contour in contours:
+        if cv2.contourArea(contour) >= min_area:
+            cv2.drawContours(cleaned, [contour], -1, 255, -1)
+
+    # --- Step 5: Extract polygons ---
     regions = []
-    try:
-        masks_data = await asyncio.to_thread(
-            client.semantic_segmentation,
-            image=pil_image,
-            model="facebook/sam-2",
-        )
-        # SAM2 may return masks differently; fall back to bounding boxes
-        for i, mask_result in enumerate(masks_data):
-            if i >= len(labels):
-                break
-            region_type = labels[i]
-            x1, y1, x2, y2 = boxes[i]
-            polygon = _mask_to_polygon(mask_result, x1, y1, x2, y2, w, h)
-            if polygon:
-                regions.append({"type": region_type, "polygon": polygon, "bbox": [x1, y1, x2, y2], "area": round((x2-x1)*(y2-y1), 1), "label": region_type.capitalize()})
-            else:
-                polygon = [{"x": x1, "y": y1}, {"x": x2, "y": y1}, {"x": x2, "y": y2}, {"x": x1, "y": y2}]
-                regions.append({"type": region_type, "polygon": polygon, "bbox": [x1, y1, x2, y2], "area": round((x2-x1)*(y2-y1), 1), "label": region_type.capitalize()})
-    except Exception as e:
-        logger.error(f"_detect_regions_hf: SAM2 exception: {e}")
-        for i, (box, label) in enumerate(zip(boxes, labels)):
-            x1, y1, x2, y2 = box
-            regions.append({"type": label, "polygon": [{"x": x1, "y": y1}, {"x": x2, "y": y1}, {"x": x2, "y": y2}, {"x": x1, "y": y2}], "bbox": [x1, y1, x2, y2], "area": round((x2-x1)*(y2-y1), 1), "label": label.capitalize()})
+    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area:
+            continue
 
-    regions.sort(key=lambda r: (r["bbox"][1], r["bbox"][0]))
+        # Approximate polygon to reduce excessive points
+        epsilon = 0.01 * cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        polygon = [{"x": float(pt[0][0]), "y": float(pt[0][1])} for pt in approx]
+
+        if len(polygon) >= 3:
+            x, y, bw, bh = cv2.boundingRect(contour)
+            regions.append({
+                "type": "wall",
+                "polygon": polygon,
+                "bbox": [float(x), float(y), float(x + bw), float(y + bh)],
+                "area": round(area, 1),
+                "label": "Wall",
+            })
+
+    if not regions:
+        logger.warning("_detect_regions_hf: no valid regions found after cleanup")
+        return None
+
+    # Prefer one large wall polygon over many fragmented regions
+    regions.sort(key=lambda r: r["area"], reverse=True)
     logger.info(f"_detect_regions_hf: returning {len(regions)} regions")
     return regions[:10]
 
 
-def _mask_to_polygon(mask_data, x1, y1, x2, y2, w, h):
-    try:
-        import cv2, numpy as np, base64
-        if isinstance(mask_data, dict):
-            mask_data = mask_data.get("mask", mask_data.get("data"))
-        if isinstance(mask_data, str):
-            mask = np.frombuffer(base64.b64decode(mask_data), dtype=np.uint8).reshape((int(y2-y1), int(x2-x1)))
-        elif isinstance(mask_data, list):
-            mask_arr = np.array(mask_data, dtype=np.uint8)
-            mask = mask_arr.reshape((int(y2-y1), int(x2-x1))) if mask_arr.ndim == 1 else mask_arr
-        else:
-            return None
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return None
-        largest = max(contours, key=cv2.contourArea)
-        approx = cv2.approxPolyDP(largest, 0.02 * cv2.arcLength(largest, True), True)
-        polygon = [{"x": float(pt[0][0] + x1), "y": float(pt[0][1] + y1)} for pt in approx]
-        return polygon if len(polygon) >= 3 else None
-    except Exception:
-        return None
-
-
 def _detect_regions_local(image_path):
-    """Structured facade-based detection with fixed band boundaries."""
+    """Structured facade-based detection with fixed band boundaries.
+
+    This is a fallback detector that uses OpenCV edge detection to identify
+    facade regions. It does not require any external API calls.
+    """
     try:
-        import cv2, numpy as np
+        import cv2
+        import numpy as np
     except ImportError:
         return []
     img = cv2.imread(image_path)
@@ -328,33 +265,17 @@ async def detect_regions(image_url):
     else:
         local_path = image_url
     logger.info(f"detect_regions: image_url={image_url}, local_path={local_path}, exists={os.path.exists(local_path)}")
-    if os.path.exists(local_path):
-        logger.info("detect_regions: trying Grounding DINO + SAM2 pipeline")
-        hf_result = await _detect_regions_hf(local_path)
-        if hf_result:
-            logger.info(f"detect_regions: HF pipeline succeeded, {len(hf_result)} regions")
-            return {"success": True, "regions": hf_result, "method": "grounding-dino-sam2"}
-        logger.warning("detect_regions: HF pipeline returned no results")
-    if os.path.exists(local_path):
-        logger.info("detect_regions: trying local OpenCV detection")
-        regions = _detect_regions_local(local_path)
-        if regions:
-            logger.info(f"detect_regions: local OpenCV succeeded, {len(regions)} regions")
-            return {"success": True, "regions": regions, "method": "local-opencv"}
-        logger.warning("detect_regions: local OpenCV returned no results")
-    if settings.replicate_api_token and settings.replicate_api_token != "":
-        logger.info("detect_regions: trying Replicate SAM-2")
-        client = replicate.Client(api_token=settings.replicate_api_token)
-        try:
-            output = client.run("meta/sam-2", input={"image": image_url, "task": "segment"})
-            result = {"success": True, "regions": output if output else [], "method": "replicate-sam2"}
-            logger.info("detect_regions: Replicate SAM-2 succeeded")
-            return result
-        except Exception as e:
-            logger.error(f"detect_regions: Replicate SAM-2 failed: {e}")
-            return {"success": False, "error": str(e), "regions": []}
-    logger.error("detect_regions: no detection method available")
-    return {"success": False, "error": "No detection method available", "regions": []}
+    if not os.path.exists(local_path):
+        logger.error(f"detect_regions: image file not found at {local_path}")
+        return {"success": False, "error": "Image file not found", "regions": []}
+    logger.info("detect_regions: trying SegFormer semantic segmentation pipeline")
+    hf_result = await _detect_regions_hf(local_path)
+    if hf_result:
+        logger.info(f"detect_regions: SegFormer pipeline succeeded, {len(hf_result)} regions")
+        return {"success": True, "regions": hf_result, "method": "segformer-cityscapes"}
+    logger.error("detect_regions: SegFormer pipeline failed")
+    return {"success": False, "error": "SegFormer pipeline failed", "regions": []}
+
 
 async def generate_visualization(image_url, mask_url, material_prompt, region_type):
     if not settings.replicate_api_token or settings.replicate_api_token == "your-replicate-api-token":
@@ -375,4 +296,3 @@ async def generate_full_visualization(image_url, regions_config):
         result = await generate_visualization(image_url=image_url, mask_url=region.get("mask_url", ""), material_prompt=region.get("material_prompt", ""), region_type=region.get("type", "wall"))
         results.append(result)
     return {"success": any(r.get("success") for r in results), "results": results}
-

@@ -179,7 +179,7 @@ async def detect_regions(image_url):
                 input={
                     "image": f,
                     "query": dino_query,
-                    "box_threshold": 0.25,
+                    "box_threshold": 0.40,
                     "text_threshold": 0.25,
                     "show_visualisation": False
                 }

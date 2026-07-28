@@ -106,7 +106,7 @@ async def detect_regions(image_url):
 
     try:
         from huggingface_hub import InferenceClient
-        client = InferenceClient(api_key=hf_token, timeout=60)
+        client = InferenceClient(api_key=hf_token, timeout=60,provider="hf-inference")
         
         logger.info("Executing Mask2Former ADE20K inference...")
         raw_results = await asyncio.to_thread(

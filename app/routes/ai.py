@@ -38,6 +38,104 @@ class RefineRegionsRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Detection Post-Processing Filters (NMS & Spatial Cleanup)
+# ---------------------------------------------------------------------------
+
+def _calculate_iou(box1: List[float], box2: List[float]) -> float:
+    """Calculate Intersection over Union (IoU) for two [x1, y1, x2, y2] bounding boxes."""
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+
+    inter_area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    if inter_area == 0:
+        return 0.0
+
+    box1_area = max(0.0, box1[2] - box1[0]) * max(0.0, box1[3] - box1[1])
+    box2_area = max(0.0, box2[2] - box2[0]) * max(0.0, box2[3] - box2[1])
+
+    union_area = box1_area + box2_area - inter_area
+    if union_area <= 0:
+        return 0.0
+
+    return inter_area / union_area
+
+
+def _filter_and_clean_regions(
+    regions: List[dict],
+    image_width: Optional[int] = None,
+    image_height: Optional[int] = None,
+    score_threshold: float = 0.38,
+    iou_threshold: float = 0.35,
+) -> List[dict]:
+    """Applies Class-Wise NMS, micro-box filtering, and ground/lawn false-positive rules."""
+    if not regions:
+        return []
+
+    candidates = []
+    for r in regions:
+        score = r.get("confidence", r.get("score", 1.0))
+        if score < score_threshold:
+            continue
+
+        # Extract bounding box [x1, y1, x2, y2]
+        bbox = r.get("bbox")
+        if not bbox and r.get("polygon"):
+            xs = [p["x"] for p in r["polygon"] if "x" in p]
+            ys = [p["y"] for p in r["polygon"] if "y" in p]
+            if xs and ys:
+                bbox = [min(xs), min(ys), max(xs), max(ys)]
+
+        if not bbox or len(bbox) < 4:
+            continue
+
+        x1, y1, x2, y2 = bbox
+        w, h = max(0.0, x2 - x1), max(0.0, y2 - y1)
+        box_area = w * h
+
+        # Apply spatial & area rules if image dimensions are available
+        if image_width and image_height and image_width > 0 and image_height > 0:
+            total_area = float(image_width * image_height)
+            
+            # 1. Micro-box filter (ignore noise boxes < 1.5% of image area)
+            if box_area < (0.015 * total_area):
+                continue
+
+            # 2. Ground/Lawn filter (reject bottom 28% flat boxes falsely labeled as walls)
+            label = str(r.get("label", r.get("type", ""))).lower()
+            center_y = (y1 + y2) / 2.0
+            if ("wall" in label or "exterior" in label) and center_y > (0.72 * image_height):
+                aspect_ratio = w / (h + 1e-5)
+                if aspect_ratio > 2.5:
+                    continue
+
+        candidates.append((score, bbox, r))
+
+    # Perform Class-Wise Non-Maximum Suppression (NMS)
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    keep_regions = []
+    label_groups: dict = {}
+
+    for score, bbox, region_data in candidates:
+        label = str(region_data.get("type", region_data.get("label", "unknown"))).lower()
+        if label not in label_groups:
+            label_groups[label] = []
+
+        should_keep = True
+        for existing_score, existing_bbox, _ in label_groups[label]:
+            if _calculate_iou(bbox, existing_bbox) > iou_threshold:
+                should_keep = False
+                break
+
+        if should_keep:
+            label_groups[label].append((score, bbox, region_data))
+            keep_regions.append(region_data)
+
+    return keep_regions
+
+
+# ---------------------------------------------------------------------------
 # Inpainting generation using huggingface_hub.InferenceClient
 # ---------------------------------------------------------------------------
 
@@ -52,8 +150,6 @@ REGION_PROMPT_MAP = {
     "door": "front door",
 }
 
-# Models for material editing/inpainting.
-# Note: FLUX.1-Fill-dev is specifically optimized for mask-based inpainting.
 MODELS = [
     ("replicate", "black-forest-labs/FLUX.1-Kontext-dev"),
     ("replicate", "black-forest-labs/FLUX.1-Fill-dev"),
@@ -68,7 +164,6 @@ NEGATIVE_PROMPT = (
     "mutilated, disfigured hands, poorly drawn hands, poorly drawn face"
 )
 
-# Map HF model names to Replicate model IDs
 REPLICATE_MODEL_MAP = {
     "black-forest-labs/FLUX.1-Kontext-dev": "black-forest-labs/flux-kontext-dev",
     "black-forest-labs/FLUX.1-Fill-dev": "black-forest-labs/flux-dev",
@@ -121,18 +216,12 @@ async def _generate_material_image(
     mask: Image.Image = None,
     replicate_token: str = None,
 ) -> Optional[Image.Image]:
-    """Generate a modified image using image_to_image with mask.
-
-    For 'replicate' provider, uses the Replicate SDK directly (bypasses
-    HF router's 60s timeout). For other providers, uses HF InferenceClient.
-    """
     import asyncio
 
     if mask is None:
         logger.warning(f"No mask provided for model {model_name}")
         return None
 
-    # Use Replicate SDK directly for replicate provider (longer timeout)
     if provider == "replicate":
         if not replicate_token:
             logger.warning(f"No Replicate token available for model {model_name}")
@@ -144,7 +233,6 @@ async def _generate_material_image(
 
             client = replicate_sdk.Client(api_token=replicate_token)
 
-            # Convert images to base64 data URIs
             img_buffer = io.BytesIO()
             image.save(img_buffer, format="PNG")
             img_b64 = base64.b64encode(img_buffer.getvalue()).decode("utf-8")
@@ -169,13 +257,10 @@ async def _generate_material_image(
                     },
                 )
 
-                # Replicate SDK returns a FileOutput object with .url and .read()
-                # Handle FileOutput, URL string, or list of URLs
                 result_url = None
                 if hasattr(output, "url"):
                     result_url = output.url
                 elif hasattr(output, "read"):
-                    # FileOutput with read() method — read bytes directly
                     return Image.open(io.BytesIO(output.read())).convert("RGB")
                 elif isinstance(output, list) and len(output) > 0:
                     result_url = output[0]
@@ -200,7 +285,6 @@ async def _generate_material_image(
             logger.warning(f"Replicate inference failed for {model_name} via {provider}: {e}")
             return None
 
-    # Use HF InferenceClient for wavespeed, fal-ai, etc.
     if not hf_token:
         logger.warning(f"No HF token available for model {model_name}")
         return None
@@ -216,12 +300,10 @@ async def _generate_material_image(
 
         def _call_image_to_image_with_mask():
             try:
-                # Convert source image to bytes
                 img_buffer = io.BytesIO()
                 image.save(img_buffer, format="PNG")
                 img_bytes = img_buffer.getvalue()
 
-                # Convert mask to base64 Data URI string so kwargs can be JSON-serialized
                 mask_buffer = io.BytesIO()
                 mask.save(mask_buffer, format="PNG")
                 mask_b64 = base64.b64encode(mask_buffer.getvalue()).decode("utf-8")
@@ -253,7 +335,6 @@ async def _generate_inpainting_preview(
     hf_token: str,
     replicate_token: str = None,
 ) -> dict:
-    """Generate an inpainting preview using huggingface_hub.InferenceClient."""
     from PIL import ImageChops
     import numpy as np
 
@@ -304,7 +385,6 @@ async def _generate_inpainting_preview(
 
         dilated_mask = _dilate_mask(merged_mask, kernel_size=15)
 
-        # Save debug mask for inspection
         debug_mask_path = os.path.join(outputs_dir, f"debug_mask_{material}.png")
         dilated_mask.save(debug_mask_path, "PNG")
         logger.info(f"Saved debug mask to {debug_mask_path}")
@@ -326,9 +406,6 @@ async def _generate_inpainting_preview(
             )
 
             if generated is not None:
-                # Verify the model actually changed something — some providers
-                # silently ignore the mask and return an identical or near-identical
-                # image. Compute the average pixel difference as a percentage.
                 resized_current = current_image.resize(generated.size)
                 diff = ImageChops.difference(resized_current, generated)
                 diff_array = np.array(diff.convert("L"))
@@ -342,7 +419,6 @@ async def _generate_inpainting_preview(
                     )
                     continue
 
-                # Save debug difference image
                 debug_diff_path = os.path.join(
                     outputs_dir, f"debug_diff_{material}_{provider}.png"
                 )
@@ -392,7 +468,6 @@ async def _generate_replicate_preview(
     regions: List[RegionConfig],
     replicate_token: str,
 ) -> dict:
-    """Fallback: generate preview using Replicate's stable-diffusion-inpainting."""
     import replicate
 
     client = replicate.Client(api_token=replicate_token)
@@ -488,13 +563,24 @@ async def detect_regions_route(
     data: DetectRegionsRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    """Detect building surface regions using Grounding DINO + SAM2 (or local fallback)."""
+    """Detect building surface regions using Grounding DINO + SAM2 with active NMS filtering."""
     image_url = data.image_url
     if not image_url:
         raise HTTPException(status_code=400, detail="image_url is required")
 
     logger.info(f"detect_regions: image_url={image_url}")
     result = await detect_regions_service(image_url)
+
+    # Filter out hallucinated duplicate boxes & grass noise before returning
+    if result.get("success") and result.get("regions"):
+        result["regions"] = _filter_and_clean_regions(
+            result["regions"],
+            image_width=result.get("image_width"),
+            image_height=result.get("image_height"),
+            score_threshold=0.38,
+            iou_threshold=0.35,
+        )
+
     return result
 
 
@@ -514,8 +600,16 @@ async def refine_regions_route(
     result = await detect_regions_service(image_url)
 
     if result.get("success") and result.get("regions"):
+        cleaned_raw_regions = _filter_and_clean_regions(
+            result["regions"],
+            image_width=result.get("image_width"),
+            image_height=result.get("image_height"),
+            score_threshold=0.38,
+            iou_threshold=0.35,
+        )
+
         refined = []
-        for r in result["regions"]:
+        for r in cleaned_raw_regions:
             polygon = []
             if r.get("bbox"):
                 x1, y1, x2, y2 = r["bbox"]
@@ -539,7 +633,8 @@ async def refine_regions_route(
 
         return {"success": True, "regions": refined}
     else:
-        return {"success": False, "error": result.get("message", "AI refinement failed")}
+        err_msg = result.get("message") or result.get("error") or "AI refinement failed"
+        return {"success": False, "error": err_msg, "message": err_msg}
 
 
 @router.post("/generate-preview")

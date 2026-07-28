@@ -1,451 +1,610 @@
+import base64
+import io
 import logging
 import os
-import asyncio
-import io
-import cv2
-import json
-import re
-import numpy as np
-import replicate
-from replicate.exceptions import ReplicateError
-from ..config import get_settings
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
+from PIL import Image, ImageDraw, ImageFilter
 
+from ..config import get_settings
+from ..middleware.auth import get_current_user
+from ..services.image_service import generate_mask_for_region
+from ..services.ai_service import detect_regions as detect_regions_service
+
+router = APIRouter(prefix="/api/ai", tags=["AI"])
 settings = get_settings()
 logger = logging.getLogger("e2m.ai")
 
-# Normalization mapping for DINO labels to unify classes
-LABEL_MAP = {
-    "glass": "window",
-    "glass window": "window",
-    "garage": "door",
-    "garage door": "door",
-    "column": "pillar",
-    "railing": "balcony",
-    "terrace": "parapet",
-    "chimney": "roof"
+
+class RegionConfig(BaseModel):
+    type: str
+    selected_material: str
+    polygon: List[dict] = []
+
+
+class GeneratePreviewRequest(BaseModel):
+    image_path: str
+    regions: List[RegionConfig]
+
+
+class DetectRegionsRequest(BaseModel):
+    image_url: str
+
+
+class RefineRegionsRequest(BaseModel):
+    image_path: str
+    regions: List[dict]
+
+
+# ---------------------------------------------------------------------------
+# Inpainting generation using huggingface_hub.InferenceClient
+# ---------------------------------------------------------------------------
+
+REGION_PROMPT_MAP = {
+    "wall": "exterior wall",
+    "roof": "roof",
+    "window": "window frames",
+    "balcony": "balcony railing",
+    "pillar": "pillar",
+    "parapet": "parapet wall",
+    "gate": "gate and entrance",
+    "door": "front door",
 }
 
-# Maximum parallel SAM 3 API calls sent to Replicate simultaneously
-CONCURRENCY_LIMIT = getattr(settings, "replicate_concurrency_limit", 3)
+# Models for material editing/inpainting.
+# Note: FLUX.1-Fill-dev is specifically optimized for mask-based inpainting.
+MODELS = [
+    ("replicate", "black-forest-labs/FLUX.1-Kontext-dev"),
+    ("replicate", "black-forest-labs/FLUX.1-Fill-dev"),
+    ("replicate", "Qwen/Qwen-Image-Edit"),
+    ("wavespeed", "black-forest-labs/FLUX.1-Kontext-dev"),
+    ("fal-ai", "Qwen/Qwen-Image-Edit"),
+]
+
+NEGATIVE_PROMPT = (
+    "blurry, distorted, cartoon, illustration, low quality, inconsistent lighting, "
+    "deformed, extra limbs, disfigured, text, signature, watermark, ugly, morbid, "
+    "mutilated, disfigured hands, poorly drawn hands, poorly drawn face"
+)
+
+# Map HF model names to Replicate model IDs
+REPLICATE_MODEL_MAP = {
+    "black-forest-labs/FLUX.1-Kontext-dev": "black-forest-labs/flux-kontext-dev",
+    "black-forest-labs/FLUX.1-Fill-dev": "black-forest-labs/flux-dev",
+    "Qwen/Qwen-Image-Edit": "qwen/qwen-image-edit",
+}
 
 
-def _classify_region_by_rules(label_raw, rel_y, bw, bh, w, h, img_crop=None):
-    """Fallback classifier based on geometry and visual heuristics."""
-    label_lower = (label_raw or "").lower()
-
-    if "roof" in label_lower or "eave" in label_lower or "chimney" in label_lower:
-        return "roof"
-    if "window" in label_lower or "glass" in label_lower or "trim" in label_lower:
-        return "window"
-    if "balcony" in label_lower or "railing" in label_lower:
-        return "balcony"
-    if "pillar" in label_lower or "column" in label_lower:
-        return "pillar"
-    if "parapet" in label_lower or "terrace" in label_lower or "fence" in label_lower:
-        return "parapet"
-    if "gate" in label_lower or "door" in label_lower or "entrance" in label_lower:
-        return "gate"
-        
-    if img_crop is not None and img_crop.size > 0:
-        gray_crop = cv2.cvtColor(img_crop, cv2.COLOR_BGR2GRAY)
-        mean_val = np.mean(gray_crop)
-        if mean_val < 110 and (bw < 0.4 * w and bh < 0.4 * h):
-            if bw * bh > 1000:
-                return "window"
-
-    if rel_y < 0.15:
-        return "roof"
-    if bw < w * 0.12 and bh > h * 0.15:
-        return "pillar"
-        
-    return "wall"
-
-
-def _compute_bbox_iou(boxA, boxB):
-    """Calculates Intersection over Union (IoU) between two bounding boxes [x1, y1, x2, y2]."""
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-
-    interArea = max(0.0, xB - xA) * max(0.0, yB - yA)
-    boxAArea = max(0.0, boxA[2] - boxA[0]) * max(0.0, boxA[3] - boxA[1])
-    boxBArea = max(0.0, boxB[2] - boxB[0]) * max(0.0, boxB[3] - boxB[1])
-
-    return interArea / float(boxAArea + boxBArea - interArea + 1e-6)
-
-
-def _parse_box_coords(box_data):
-    """Safely extracts [x1, y1, x2, y2] from various BBox schema formats."""
-    if not box_data:
-        return None
-    try:
-        if isinstance(box_data, dict):
-            x1 = float(box_data.get("xmin", box_data.get("x1", 0)))
-            y1 = float(box_data.get("ymin", box_data.get("y1", 0)))
-            x2 = float(box_data.get("xmax", box_data.get("x2", 0)))
-            y2 = float(box_data.get("ymax", box_data.get("y2", 0)))
-        elif isinstance(box_data, list) and len(box_data) == 4:
-            x1, y1, x2, y2 = map(float, box_data)
-            if x2 < x1 or y2 < y1:  # Fallback for [x, y, w, h] format
-                x2 = x1 + x2
-                y2 = y1 + y2
-        else:
-            return None
-        return [x1, y1, x2, y2] if (x2 > x1 and y2 > y1) else None
-    except Exception:
-        return None
-
-
-def _apply_dino_nms(detections, iou_threshold=0.55):
-    """Prunes duplicate/overlapping DINO bounding boxes BEFORE calling SAM 3."""
-    if not detections:
-        return []
-
-    sorted_dets = sorted(
-        detections, 
-        key=lambda d: float(d.get("confidence", d.get("score", 0.85))), 
-        reverse=True
+def _build_material_prompt(region_type: str, material: str) -> str:
+    region_desc = REGION_PROMPT_MAP.get(region_type, region_type)
+    return (
+        f"Replace ONLY the masked {region_desc} with {material}. "
+        f"Transform the white painted {region_desc} into realistic {material} "
+        f"with visible texture and mortar joints. "
+        f"The change must be clearly visible. "
+        f"Keep the glass unchanged. "
+        f"Keep the building geometry identical. "
+        f"Do not modify any unmasked pixels. "
+        f"Ignore everything outside the mask. "
+        f"Ultra realistic architecture photo, 8k detail."
     )
-    keep = []
-
-    while sorted_dets:
-        current = sorted_dets.pop(0)
-        curr_box = _parse_box_coords(current.get("bbox") or current.get("box"))
-        if not curr_box:
-            continue
-            
-        keep.append(current)
-
-        filtered = []
-        for det in sorted_dets:
-            box = _parse_box_coords(det.get("bbox") or det.get("box"))
-            if box and _compute_bbox_iou(curr_box, box) >= iou_threshold:
-                continue  # Drop duplicate box
-            filtered.append(det)
-
-        sorted_dets = filtered
-
-    return keep
 
 
-async def _run_replicate_with_retry(client, model, input_data, max_retries=6):
+def _load_image(path: str) -> Image.Image:
+    img = Image.open(path).convert("RGB")
+    return img
+
+
+def _load_mask(path: str) -> Image.Image:
+    mask = Image.open(path).convert("L")
+    return mask
+
+
+def _dilate_mask(mask: Image.Image, kernel_size: int = 5) -> Image.Image:
+    """Dilate a binary mask to avoid seams where old material shows through."""
+    import numpy as np
+    import cv2
+
+    mask_array = np.array(mask)
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    dilated = cv2.dilate(mask_array, kernel, iterations=1)
+    return Image.fromarray(dilated)
+
+
+async def _generate_material_image(
+    image: Image.Image,
+    prompt: str,
+    model_name: str,
+    provider: str,
+    hf_token: str = None,
+    mask: Image.Image = None,
+    replicate_token: str = None,
+) -> Optional[Image.Image]:
+    """Generate a modified image using image_to_image with mask.
+
+    For 'replicate' provider, uses the Replicate SDK directly (bypasses
+    HF router's 60s timeout). For other providers, uses HF InferenceClient.
     """
-    Executes a Replicate model call with non-blocking async retries, parsing 429 
-    rate limit reset times dynamically or applying exponential backoff.
-    """
-    for attempt in range(max_retries):
+    import asyncio
+
+    if mask is None:
+        logger.warning(f"No mask provided for model {model_name}")
+        return None
+
+    # Use Replicate SDK directly for replicate provider (longer timeout)
+    if provider == "replicate":
+        if not replicate_token:
+            logger.warning(f"No Replicate token available for model {model_name}")
+            return None
+
+        replicate_model_id = REPLICATE_MODEL_MAP.get(model_name, model_name.lower())
         try:
-            return await asyncio.to_thread(client.run, model, input=input_data)
-        except Exception as e:
-            err_msg = str(e)
-            status_code = getattr(e, "status", None)
+            import replicate as replicate_sdk
 
-            # Check if rate limit error was thrown (HTTP 429 or error text)
-            if status_code == 429 or "429" in err_msg or "rate limit" in err_msg.lower() or "resets in" in err_msg.lower():
-                # Extract wait time from error message like "resets in ~9s" if present
-                reset_match = re.search(r"resets in ~?(\d+)s", err_msg, re.IGNORECASE)
-                if reset_match:
-                    wait_time = int(reset_match.group(1)) + 1
+            client = replicate_sdk.Client(api_token=replicate_token)
+
+            # Convert images to base64 data URIs
+            img_buffer = io.BytesIO()
+            image.save(img_buffer, format="PNG")
+            img_b64 = base64.b64encode(img_buffer.getvalue()).decode("utf-8")
+            img_data_uri = f"data:image/png;base64,{img_b64}"
+
+            mask_buffer = io.BytesIO()
+            mask.save(mask_buffer, format="PNG")
+            mask_b64 = base64.b64encode(mask_buffer.getvalue()).decode("utf-8")
+            mask_data_uri = f"data:image/png;base64,{mask_b64}"
+
+            def _call_replicate():
+                output = client.run(
+                    replicate_model_id,
+                    input={
+                        "input_image": img_data_uri,
+                        "mask": mask_data_uri,
+                        "prompt": prompt,
+                        "negative_prompt": NEGATIVE_PROMPT,
+                        "guidance_scale": 10.0,
+                        "num_inference_steps": 45,
+                        "output_format": "png",
+                    },
+                )
+
+                # Replicate SDK returns a FileOutput object with .url and .read()
+                # Handle FileOutput, URL string, or list of URLs
+                result_url = None
+                if hasattr(output, "url"):
+                    result_url = output.url
+                elif hasattr(output, "read"):
+                    # FileOutput with read() method — read bytes directly
+                    return Image.open(io.BytesIO(output.read())).convert("RGB")
+                elif isinstance(output, list) and len(output) > 0:
+                    result_url = output[0]
+                elif isinstance(output, str):
+                    result_url = output
                 else:
-                    wait_time = (2 ** attempt) + 1  # Exponential backoff fallback
+                    return None
 
-                logger.warning(
-                    f"Replicate 429 Rate Limit hit on attempt {attempt + 1}/{max_retries}. "
-                    f"Waiting {wait_time}s before retrying..."
-                )
-                await asyncio.sleep(wait_time)
-            else:
-                logger.error(f"Non-retryable Replicate error encountered: {e}")
-                raise e
-
-    raise RuntimeError(f"Exceeded maximum retries ({max_retries}) for model {model}")
-
-
-def _generate_fg_bg_points(target_box_crop, crop_w, crop_h):
-    """Generates 16 foreground grid points and 8 background padding points."""
-    tx1, ty1, tx2, ty2 = target_box_crop
-    tbw = tx2 - tx1
-    tbh = ty2 - ty1
-
-    points = []
-    labels = []
-
-    # 1. Foreground Points (4x4 Grid)
-    fg_x = np.linspace(tx1 + tbw * 0.15, tx2 - tbw * 0.15, 4)
-    fg_y = np.linspace(ty1 + tbh * 0.15, ty2 - tbh * 0.15, 4)
-    for x in fg_x:
-        for y in fg_y:
-            points.append([int(x), int(y)])
-            labels.append(1)
-
-    # 2. Background Points
-    bg_candidates = [
-        [tx1 / 2.0, ty1 / 2.0],
-        [tx1 + tbw / 2.0, ty1 / 2.0],
-        [tx2 + (crop_w - tx2) / 2.0, ty1 / 2.0],
-        [tx1 / 2.0, ty1 + tbh / 2.0],
-        [tx2 + (crop_w - tx2) / 2.0, ty1 + tbh / 2.0],
-        [tx1 / 2.0, ty2 + (crop_h - ty2) / 2.0],
-        [tx1 + tbw / 2.0, ty2 + (crop_h - ty2) / 2.0],
-        [tx2 + (crop_w - tx2) / 2.0, ty2 + (crop_h - ty2) / 2.0]
-    ]
-
-    for px, py in bg_candidates:
-        if 0 <= px < crop_w and 0 <= py < crop_h:
-            points.append([int(px), int(py)])
-            labels.append(0)
-
-    return points, labels
-
-
-async def detect_regions(image_url):
-    """
-    Production-grade detection pipeline:
-    1. Grounding DINO -> Raw bounding boxes
-    2. Pre-SAM NMS -> Filter duplicate target boxes up front
-    3. Concurrency-throttled SAM 3 execution with 429 retry backoff
-    4. Polygon extraction, box validation, and output construction
-    """
-    if not settings.replicate_api_token or settings.replicate_api_token == "your-replicate-api-token":
-        return {"success": False, "error": "Replicate API token not configured.", "regions": []}
-
-    uploads_dir = os.path.abspath(settings.upload_dir)
-    
-    if image_url.startswith("/uploads/"):
-        local_path = os.path.join(uploads_dir, image_url[len("/uploads/"):])
-    elif image_url.startswith("uploads/"):
-        local_path = os.path.abspath(image_url)
-    else:
-        local_path = image_url
-
-    if not os.path.exists(local_path):
-        return {"success": False, "error": "Image file not found on server", "regions": []}
-
-    img = cv2.imread(local_path)
-    if img is None:
-        return {"success": False, "error": "Failed to read image with OpenCV", "regions": []}
-    
-    h, w = img.shape[:2]
-    total_image_area = w * h
-    min_area = total_image_area * 0.0002
-
-    client = replicate.Client(api_token=settings.replicate_api_token)
-
-    dino_query = ",".join([
-        "roof", "wall", "window", "glass window", "door", 
-        "garage door", "balcony", "railing", "column", 
-        "pillar", "chimney", "gate", "fence", "parapet"
-    ])
-
-    # 1. Grounding DINO Call with 429 Retry Protection
-    try:
-        logger.info("Executing Grounding DINO detection...")
-        with open(local_path, "rb") as image_file:
-            dino_output = await _run_replicate_with_retry(
-                client,
-                "adirik/grounding-dino:efd10a8ddc57ea28773327e881ce95e20cc1d734c589f7dd01d2036921ed78aa",
-                input_data={
-                    "image": image_file,
-                    "query": dino_query,
-                    "box_threshold": 0.25,
-                    "text_threshold": 0.25,
-                    "show_visualisation": False
-                }
-            )
-    except Exception as e:
-        logger.error(f"Grounding DINO Inference failed: {e}")
-        return {"success": False, "error": f"Grounding DINO Error: {str(e)}", "regions": []}
-
-    detections = dino_output.get("detections", []) if isinstance(dino_output, dict) else (dino_output if isinstance(dino_output, list) else [])
-    
-    if not detections:
-        return {"success": True, "regions": [], "method": "grounding-dino-sam3-rate-limited"}
-
-    # 2. Apply Pre-SAM NMS to cut down unnecessary API calls
-    pruned_detections = _apply_dino_nms(detections, iou_threshold=0.55)
-    logger.info(f"DINO found {len(detections)} raw boxes -> Pruned down to {len(pruned_detections)} distinct targets.")
-
-    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-
-    async def _process_single_target(det, idx):
-        raw_label = det.get("label", "wall").lower()
-        norm_label = LABEL_MAP.get(raw_label, raw_label)
-        dino_conf = float(det.get("confidence", det.get("score", 0.85)))
-
-        box = _parse_box_coords(det.get("bbox") or det.get("box"))
-        if not box:
-            return None
-
-        x1, y1, x2, y2 = box
-        bw, bh = x2 - x1, y2 - y1
-
-        # Padded Crop (20% context)
-        pad_x, pad_y = int(bw * 0.20), int(bh * 0.20)
-        crop_x1, crop_y1 = max(0, int(x1) - pad_x), max(0, int(y1) - pad_y)
-        crop_x2, crop_y2 = min(w, int(x2) + pad_x), min(h, int(y2) + pad_y)
-        
-        crop_w, crop_h = crop_x2 - crop_x1, crop_y2 - crop_y1
-        if crop_w < 10 or crop_h < 10:
-            return None
-
-        crop_img = img[crop_y1:crop_y2, crop_x1:crop_x2]
-        is_success, buffer = cv2.imencode(".jpg", crop_img)
-        if not is_success:
-            return None
-            
-        io_buf = io.BytesIO(buffer)
-        io_buf.name = "crop.jpg"
-
-        target_box_crop = [int(x1 - crop_x1), int(y1 - crop_y1), int(x2 - crop_x1), int(y2 - crop_y1)]
-        pts, pt_labels = _generate_fg_bg_points(target_box_crop, crop_w, crop_h)
-
-        # Semaphore regulates how many SAM 3 calls fire concurrently
-        async with semaphore:
-            try:
-                sam_output = await _run_replicate_with_retry(
-                    client,
-                    "yodagg/sam3-image-seg:753fe4dbdd890a55e176f19b0603ae1b43c9e7fbd916070df53ffdb2451c7a57",
-                    input_data={
-                        "image": io_buf,
-                        "prompt": norm_label,
-                        "points": json.dumps(pts),
-                        "point_labels": json.dumps(pt_labels),
-                        "return_polygons": True,
-                        "visualize_output": False,
-                        "multimask_output": True,
-                        "confidence_threshold": 0.4,
-                        "max_masks": 5
-                    }
-                )
-            except Exception as sam_err:
-                logger.warning(f"SAM 3 failed for target '{norm_label}': {sam_err}")
+                import httpx
+                http_client = httpx.Client(timeout=120)
+                resp = http_client.get(result_url)
+                if resp.status_code == 200:
+                    return Image.open(io.BytesIO(resp.content)).convert("RGB")
+                logger.error(f"Replicate returned HTTP {resp.status_code} for {replicate_model_id}")
                 return None
 
-        if not sam_output or not isinstance(sam_output, dict):
+            result = await asyncio.to_thread(_call_replicate)
+            if result is not None:
+                logger.info(f"Replicate inference succeeded for {model_name} via {provider}")
+            return result
+        except Exception as e:
+            logger.warning(f"Replicate inference failed for {model_name} via {provider}: {e}")
             return None
 
-        pred_polygons = sam_output.get("pred_polygons", [])
-        pred_scores = sam_output.get("pred_scores", [])
-        pred_boxes = sam_output.get("pred_boxes", [])
+    # Use HF InferenceClient for wavespeed, fal-ai, etc.
+    if not hf_token:
+        logger.warning(f"No HF token available for model {model_name}")
+        return None
 
-        if not pred_polygons or not pred_scores:
-            return None
+    try:
+        from huggingface_hub import InferenceClient
 
-        best_idx = int(np.argmax(pred_scores))
-        best_sam_score = float(pred_scores[best_idx])
+        current_client = InferenceClient(
+            provider=provider,
+            api_key=hf_token,
+            timeout=180,
+        )
 
-        if best_idx < len(pred_boxes):
-            sam_box = pred_boxes[best_idx]
-            if len(sam_box) == 4 and _compute_bbox_iou(target_box_crop, sam_box) < 0.15:
-                return None  # Mask drifted away from target
+        def _call_image_to_image_with_mask():
+            try:
+                # Convert source image to bytes
+                img_buffer = io.BytesIO()
+                image.save(img_buffer, format="PNG")
+                img_bytes = img_buffer.getvalue()
 
-        combined_conf = (0.6 * dino_conf) + (0.4 * best_sam_score)
-        if combined_conf < 0.45:
-            return None
+                # Convert mask to base64 Data URI string so kwargs can be JSON-serialized
+                mask_buffer = io.BytesIO()
+                mask.save(mask_buffer, format="PNG")
+                mask_b64 = base64.b64encode(mask_buffer.getvalue()).decode("utf-8")
+                mask_data_uri = f"data:image/png;base64,{mask_b64}"
 
-        # Recursive Polygon Unwrapping
-        valid_pts = pred_polygons[best_idx]
-        while (
-            isinstance(valid_pts, list)
-            and len(valid_pts) > 0
-            and isinstance(valid_pts[0], list)
-            and len(valid_pts[0]) > 0
-            and isinstance(valid_pts[0][0], list)
-        ):
-            valid_pts = valid_pts[0]
+                return current_client.image_to_image(
+                    image=img_bytes,
+                    mask=mask_data_uri,
+                    prompt=prompt,
+                    negative_prompt=NEGATIVE_PROMPT,
+                    guidance_scale=10.0,
+                    num_inference_steps=45,
+                    model=model_name,
+                )
+            except StopIteration:
+                raise RuntimeError("StopIteration raised by image_to_image with mask")
 
-        if len(valid_pts) < 3:
-            return None
+        result = await asyncio.to_thread(_call_image_to_image_with_mask)
+        logger.info(f"Image-to-image with mask succeeded for {model_name} via {provider}")
+        return result
+    except Exception as e:
+        logger.warning(f"Image-to-image with mask failed for {model_name} via {provider}: {e}")
+        return None
 
-        polygon = [{"x": float(pt[0]) + crop_x1, "y": float(pt[1]) + crop_y1} for pt in valid_pts]
-        pts_np = np.array([[pt["x"], pt["y"]] for pt in polygon], dtype=np.float32)
-        area = cv2.contourArea(pts_np)
-        
-        if area < min_area:
-            return None
 
-        tx, ty, tbw, tbh = cv2.boundingRect(pts_np)
-        if tbw > 0.95 * w and tbh > 0.95 * h:
-            return None
+async def _generate_inpainting_preview(
+    image_path: str,
+    regions: List[RegionConfig],
+    hf_token: str,
+    replicate_token: str = None,
+) -> dict:
+    """Generate an inpainting preview using huggingface_hub.InferenceClient."""
+    from PIL import ImageChops
+    import numpy as np
 
-        rel_y = float(ty) / float(h)
-        mapped_type = _classify_region_by_rules(norm_label, rel_y, tbw, tbh, w, h, crop_img)
+    material_groups: dict = {}
+    for region in regions:
+        if not region.polygon or len(region.polygon) < 3:
+            logger.warning(f"Skipping region {region.type}: no valid polygon")
+            continue
+        key = region.selected_material
+        if key not in material_groups:
+            material_groups[key] = []
+        material_groups[key].append(region)
 
+    if not material_groups:
         return {
-            "id": f"{mapped_type}_{idx}",
-            "type": mapped_type,
-            "polygon": polygon,
-            "bbox": [float(tx), float(ty), float(tx + tbw), float(ty + tbh)],
-            "area": round(float(area), 1),
-            "confidence": round(combined_conf, 3),
-            "raw_label": norm_label
+            "success": False,
+            "error": "No valid regions with materials and polygons provided",
         }
 
-    # Execute throttled async pipeline
-    tasks = [_process_single_target(det, i) for i, det in enumerate(pruned_detections)]
-    results = await asyncio.gather(*tasks)
+    original_image = _load_image(image_path)
+    current_image = original_image
 
-    valid_regions = [r for r in results if r is not None]
-    valid_regions.sort(key=lambda r: r["area"], reverse=True)
+    outputs_dir = os.path.abspath(settings.output_dir)
+    os.makedirs(outputs_dir, exist_ok=True)
 
-    counts = {}
-    for r in valid_regions:
-        t = r["type"]
-        counts[t] = counts.get(t, 0) + 1
-        r["label"] = f"{t.replace('_', ' ').title()} {counts[t]}"
+    regions_succeeded = 0
+    regions_failed = 0
 
-    logger.info(f"Successfully processed {len(valid_regions)} regions without rate-limiting failures.")
-    
+    for material, group_regions in material_groups.items():
+        merged_mask = None
+        region_types = set()
+        for region in group_regions:
+            mask_path = generate_mask_for_region(
+                image_path=image_path,
+                region_polygon=region.polygon,
+                region_id=f"merged_{material}_{id(region)}",
+            )
+            mask_image = _load_mask(mask_path)
+            if merged_mask is None:
+                merged_mask = mask_image
+            else:
+                merged_mask = ImageChops.lighter(merged_mask, mask_image)
+            region_types.add(region.type)
+
+        if merged_mask is None:
+            regions_failed += len(group_regions)
+            continue
+
+        dilated_mask = _dilate_mask(merged_mask, kernel_size=15)
+
+        # Save debug mask for inspection
+        debug_mask_path = os.path.join(outputs_dir, f"debug_mask_{material}.png")
+        dilated_mask.save(debug_mask_path, "PNG")
+        logger.info(f"Saved debug mask to {debug_mask_path}")
+
+        primary_type = sorted(region_types)[0]
+        region_desc = REGION_PROMPT_MAP.get(primary_type, primary_type)
+        prompt = _build_material_prompt(region_desc, material)
+        logger.info(
+            f"Generating material '{material}' for {len(group_regions)} regions "
+            f"(types: {', '.join(sorted(region_types))})"
+        )
+
+        region_success = False
+        for provider, model_name in MODELS:
+            generated = await _generate_material_image(
+                current_image, prompt, model_name,
+                provider=provider, hf_token=hf_token, mask=dilated_mask,
+                replicate_token=replicate_token,
+            )
+
+            if generated is not None:
+                # Verify the model actually changed something — some providers
+                # silently ignore the mask and return an identical or near-identical
+                # image. Compute the average pixel difference as a percentage.
+                resized_current = current_image.resize(generated.size)
+                diff = ImageChops.difference(resized_current, generated)
+                diff_array = np.array(diff.convert("L"))
+                avg_diff_pct = (diff_array.mean() / 255.0) * 100.0
+
+                if avg_diff_pct < 1.0:
+                    logger.warning(
+                        f"Model {model_name} via {provider} returned a near-identical image "
+                        f"(avg diff: {avg_diff_pct:.2f}%). Mask may have been ignored. "
+                        f"Trying next model."
+                    )
+                    continue
+
+                # Save debug difference image
+                debug_diff_path = os.path.join(
+                    outputs_dir, f"debug_diff_{material}_{provider}.png"
+                )
+                diff.save(debug_diff_path, "PNG")
+                logger.info(
+                    f"Saved debug difference to {debug_diff_path} "
+                    f"(avg diff: {avg_diff_pct:.2f}%)"
+                )
+
+                current_image = generated
+                logger.info(f"Successfully applied material '{material}' to {len(group_regions)} regions")
+                region_success = True
+                regions_succeeded += len(group_regions)
+                break
+
+        if not region_success:
+            regions_failed += len(group_regions)
+            logger.error(f"All models failed for material '{material}'")
+
+    if regions_succeeded == 0:
+        logger.error(f"generate_preview: all {regions_failed} regions failed to generate materials")
+        return {
+            "success": False,
+            "error": (
+                f"All {regions_failed} regions failed to generate materials. "
+                "Check API tokens, model availability, and network connectivity."
+            ),
+        }
+
+    output_filename = f"ai_preview_{os.path.basename(image_path)}"
+    output_path = os.path.join(outputs_dir, output_filename)
+    current_image.save(output_path, "PNG")
+
+    logger.info(f"Preview saved to {output_path}")
     return {
         "success": True,
-        "regions": valid_regions,
-        "method": "dino-sam3-rate-limited"
+        "generated_image_url": f"/outputs/{output_filename}",
     }
 
 
-async def generate_visualization(image_url, mask_url, material_prompt, region_type):
-    """Generates modified material renders using Stable Diffusion Inpainting via Replicate."""
-    if not settings.replicate_api_token or settings.replicate_api_token == "your-replicate-api-token":
-        return {"success": False, "error": "Replicate API token not configured."}
-        
-    client = replicate.Client(api_token=settings.replicate_api_token)
-    prompt = (
-        f"Photorealistic exterior house {region_type} with {material_prompt}, "
-        f"natural lighting, architectural photography, high detail, consistent perspective, seamless blend"
+# ---------------------------------------------------------------------------
+# Fallback: Replicate inpainting
+# ---------------------------------------------------------------------------
+
+async def _generate_replicate_preview(
+    image_path: str,
+    regions: List[RegionConfig],
+    replicate_token: str,
+) -> dict:
+    """Fallback: generate preview using Replicate's stable-diffusion-inpainting."""
+    import replicate
+
+    client = replicate.Client(api_token=replicate_token)
+
+    original_image = _load_image(image_path)
+    current_image = original_image
+    outputs_dir = os.path.abspath(settings.output_dir)
+    os.makedirs(outputs_dir, exist_ok=True)
+
+    regions_succeeded = 0
+    regions_failed = 0
+
+    for region in regions:
+        if not region.polygon or len(region.polygon) < 3:
+            regions_failed += 1
+            continue
+
+        mask_path = generate_mask_for_region(
+            image_path=image_path,
+            region_polygon=region.polygon,
+            region_id=f"replicate_{region.type}_{id(region)}",
+        )
+
+        img_buffer = io.BytesIO()
+        current_image.save(img_buffer, format="PNG")
+        img_b64 = base64.b64encode(img_buffer.getvalue()).decode("utf-8")
+        img_data_uri = f"data:image/png;base64,{img_b64}"
+
+        mask_image = _load_mask(mask_path)
+        mask_buffer = io.BytesIO()
+        mask_image.save(mask_buffer, format="PNG")
+        mask_b64 = base64.b64encode(mask_buffer.getvalue()).decode("utf-8")
+        mask_data_uri = f"data:image/png;base64,{mask_b64}"
+
+        prompt = _build_material_prompt(region.type, region.selected_material)
+
+        region_success = False
+        try:
+            output = client.run(
+                "stability-ai/stable-diffusion-inpainting",
+                input={
+                    "image": img_data_uri,
+                    "mask": mask_data_uri,
+                    "prompt": prompt,
+                    "negative_prompt": NEGATIVE_PROMPT,
+                    "guidance_scale": 7.5,
+                    "num_inference_steps": 50,
+                },
+            )
+            result_url = output[0] if isinstance(output, list) and len(output) > 0 else output
+
+            import httpx
+            async with httpx.AsyncClient(timeout=120) as http_client:
+                resp = await http_client.get(result_url)
+                if resp.status_code == 200:
+                    current_image = Image.open(io.BytesIO(resp.content)).convert("RGB")
+                    logger.info(f"Replicate inpainted region '{region.type}'")
+                    region_success = True
+        except Exception as e:
+            logger.error(f"Replicate inpainting failed for region '{region.type}': {e}")
+
+        if region_success:
+            regions_succeeded += 1
+        else:
+            regions_failed += 1
+
+    if regions_succeeded == 0:
+        logger.error(f"generate_preview: Replicate fallback - all {regions_failed} regions failed")
+        return {
+            "success": False,
+            "error": (
+                f"All {regions_failed} regions failed to generate materials via Replicate. "
+                "Check API tokens and network connectivity."
+            ),
+        }
+
+    output_filename = f"ai_preview_{os.path.basename(image_path)}"
+    output_path = os.path.join(outputs_dir, output_filename)
+    current_image.save(output_path, "PNG")
+
+    return {
+        "success": True,
+        "generated_image_url": f"/outputs/{output_filename}",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@router.post("/detect-regions")
+async def detect_regions_route(
+    data: DetectRegionsRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Detect building surface regions using Grounding DINO + SAM2 (or local fallback)."""
+    image_url = data.image_url
+    if not image_url:
+        raise HTTPException(status_code=400, detail="image_url is required")
+
+    logger.info(f"detect_regions: image_url={image_url}")
+    result = await detect_regions_service(image_url)
+    return result
+
+
+@router.post("/refine-regions")
+async def refine_regions_route(
+    data: RefineRegionsRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Refine existing region polygons using AI detection with user-provided hints."""
+    image_path = data.image_path
+    if not image_path:
+        raise HTTPException(status_code=400, detail="image_path is required")
+
+    logger.info(f"refine_regions: image_path={image_path}, regions={len(data.regions)}")
+
+    image_url = image_path if image_path.startswith("/uploads/") else f"/uploads/{image_path}"
+    result = await detect_regions_service(image_url)
+
+    if result.get("success") and result.get("regions"):
+        refined = []
+        for r in result["regions"]:
+            polygon = []
+            if r.get("bbox"):
+                x1, y1, x2, y2 = r["bbox"]
+                polygon = [
+                    {"x": x1, "y": y1},
+                    {"x": x2, "y": y1},
+                    {"x": x2, "y": y2},
+                    {"x": x1, "y": y2},
+                ]
+            elif r.get("polygon"):
+                polygon = r["polygon"]
+            elif r.get("points"):
+                polygon = [{"x": p.get("x", p[0]), "y": p.get("y", p[1])} for p in r["points"]]
+
+            refined.append({
+                "type": r.get("type", r.get("label", "wall")),
+                "polygon": polygon,
+                "area": r.get("area"),
+                "label": r.get("label", r.get("type", "")),
+            })
+
+        return {"success": True, "regions": refined}
+    else:
+        return {"success": False, "error": result.get("message", "AI refinement failed")}
+
+
+@router.post("/generate-preview")
+async def generate_preview(
+    data: GeneratePreviewRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Generate a photorealistic renovation preview using inpainting."""
+    hf_token = settings.hf_api_token or os.environ.get("HF_API_TOKEN", "")
+    if not hf_token:
+        raise HTTPException(
+            status_code=400,
+            detail="Hugging Face API token not configured. Set HF_API_TOKEN in .env",
+        )
+
+    uploads_dir = os.path.abspath(settings.upload_dir)
+    if data.image_path.startswith("/uploads/"):
+        local_path = os.path.join(uploads_dir, data.image_path[len("/uploads/"):])
+    elif data.image_path.startswith("uploads/"):
+        local_path = os.path.abspath(data.image_path)
+    else:
+        local_path = os.path.join(uploads_dir, data.image_path)
+
+    if not os.path.exists(local_path):
+        raise HTTPException(status_code=404, detail="Original image not found")
+
+    valid_regions = [
+        r for r in data.regions
+        if r.selected_material and r.polygon and len(r.polygon) >= 3
+    ]
+
+    if not valid_regions:
+        raise HTTPException(
+            status_code=400,
+            detail="No valid regions with materials and polygons provided",
+        )
+
+    logger.info(
+        f"generate_preview: {len(valid_regions)} regions, "
+        f"image={os.path.basename(local_path)}"
     )
-    
+
+    replicate_token = settings.replicate_api_token
     try:
-        output = await _run_replicate_with_retry(
-            client,
-            "stability-ai/stable-diffusion-inpainting", 
-            input_data={
-                "image": image_url, 
-                "mask": mask_url, 
-                "prompt": prompt, 
-                "negative_prompt": "blurry, distorted, cartoon, illustration, low quality, inconsistent lighting", 
-                "num_outputs": 1, 
-                "guidance_scale": 7.5, 
-                "num_inference_steps": 50
-            }
+        result = await _generate_inpainting_preview(
+            local_path, valid_regions, hf_token,
+            replicate_token=replicate_token,
         )
-        result_url = output[0] if isinstance(output, list) and len(output) > 0 else output
-        return {"success": True, "generated_image_url": result_url}
+        if result.get("success"):
+            logger.info("generate_preview: HuggingFace InferenceClient succeeded")
+            return result
     except Exception as e:
-        logger.error(f"Inpainting generation failed: {e}")
-        return {"success": False, "error": str(e)}
+        logger.warning(f"generate_preview: HuggingFace InferenceClient failed: {e}")
 
+    if replicate_token and replicate_token != "your-replicate-api-token":
+        try:
+            result = await _generate_replicate_preview(local_path, valid_regions, replicate_token)
+            if result.get("success"):
+                logger.info("generate_preview: Replicate fallback succeeded")
+                return result
+        except Exception as e:
+            logger.warning(f"generate_preview: Replicate fallback failed: {e}")
 
-async def generate_full_visualization(image_url, regions_config):
-    """Applies material edits across multiple targeted regions sequentially."""
-    results = []
-    for region in regions_config:
-        result = await generate_visualization(
-            image_url=image_url, 
-            mask_url=region.get("mask_url", ""), 
-            material_prompt=region.get("material_prompt", ""), 
-            region_type=region.get("type", "wall")
-        )
-        results.append(result)
-        
-    return {"success": any(r.get("success") for r in results), "results": results}
+    raise HTTPException(
+        status_code=502,
+        detail="AI generation failed: all generation methods (HuggingFace InferenceClient, Replicate) failed. "
+        "Check API tokens and network connectivity.",
+    )

@@ -1,7 +1,9 @@
 import logging
 import os
 import asyncio
+import io
 import cv2
+import json
 import numpy as np
 import replicate
 from ..config import get_settings
@@ -9,28 +11,36 @@ from ..config import get_settings
 settings = get_settings()
 logger = logging.getLogger("e2m.ai")
 
+# Normalization mapping for DINO labels to unify classes
+LABEL_MAP = {
+    "glass": "window",
+    "glass window": "window",
+    "garage": "door",
+    "garage door": "door",
+    "column": "pillar",
+    "railing": "balcony",
+    "terrace": "parapet",
+    "chimney": "roof"
+}
+
 
 def _classify_region_by_rules(label_raw, rel_y, bw, bh, w, h, img_crop=None):
-    """
-    Classifies regions based on labels, geometric rules, and visual heuristics.
-    """
+    """Fallback classifier based on geometry and visual heuristics."""
     label_lower = (label_raw or "").lower()
 
-    if "roof" in label_lower or "eave" in label_lower:
+    if "roof" in label_lower or "eave" in label_lower or "chimney" in label_lower:
         return "roof"
-    if "window" in label_lower or "trim" in label_lower or "glass" in label_lower:
+    if "window" in label_lower or "glass" in label_lower or "trim" in label_lower:
         return "window"
     if "balcony" in label_lower or "railing" in label_lower:
         return "balcony"
     if "pillar" in label_lower or "column" in label_lower:
         return "pillar"
-    if "parapet" in label_lower or "terrace" in label_lower:
+    if "parapet" in label_lower or "terrace" in label_lower or "fence" in label_lower:
         return "parapet"
-    if "gate" in label_lower or "entrance" in label_lower or "door" in label_lower:
+    if "gate" in label_lower or "door" in label_lower or "entrance" in label_lower:
         return "gate"
         
-    # Visual Heuristic for Modern Dark Glass Windows:
-    # Modern glass is darker than white stucco walls (mean brightness < 110)
     if img_crop is not None and img_crop.size > 0:
         gray_crop = cv2.cvtColor(img_crop, cv2.COLOR_BGR2GRAY)
         mean_val = np.mean(gray_crop)
@@ -46,41 +56,96 @@ def _classify_region_by_rules(label_raw, rel_y, bw, bh, w, h, img_crop=None):
     return "wall"
 
 
-def _split_mask_with_distance_transform(binary_mask, min_area):
+def _compute_bbox_iou(boxA, boxB):
+    """Calculates Intersection over Union (IoU) between two bounding boxes [x1, y1, x2, y2]."""
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    interArea = max(0.0, xB - xA) * max(0.0, yB - yA)
+    boxAArea = max(0.0, boxA[2] - boxA[0]) * max(0.0, boxA[3] - boxA[1])
+    boxBArea = max(0.0, boxB[2] - boxB[0]) * max(0.0, boxB[3] - boxB[1])
+
+    iou = interArea / float(boxAArea + boxBArea - interArea + 1e-6)
+    return iou
+
+
+def _apply_nms(regions, iou_threshold=0.45):
+    """Applies Non-Maximum Suppression to remove heavily overlapping duplicate masks."""
+    if not regions:
+        return []
+
+    sorted_regions = sorted(regions, key=lambda r: r["confidence"], reverse=True)
+    keep = []
+
+    while sorted_regions:
+        current = sorted_regions.pop(0)
+        keep.append(current)
+        
+        sorted_regions = [
+            r for r in sorted_regions
+            if _compute_bbox_iou(current["bbox"], r["bbox"]) < iou_threshold
+        ]
+
+    return keep
+
+
+def _generate_fg_bg_points(target_box_crop, crop_w, crop_h):
     """
-    Uses Distance Transform + Watershed to split adjacent touching objects.
+    Generates structured positive points inside the target object region
+    and negative points in the padded context region outside it.
+    
+    target_box_crop: [tx1, ty1, tx2, ty2] inside the crop coordinates
     """
-    dist_transform = cv2.distanceTransform(binary_mask, cv2.DIST_L2, 5)
-    if dist_transform.max() == 0:
-        return [binary_mask]
+    tx1, ty1, tx2, ty2 = target_box_crop
+    tbw = tx2 - tx1
+    tbh = ty2 - ty1
 
-    _, foreground_seeds = cv2.threshold(dist_transform, 0.3 * dist_transform.max(), 255, cv2.THRESH_BINARY)
-    foreground_seeds = np.uint8(foreground_seeds)
+    points = []
+    labels = []
 
-    num_seeds, markers = cv2.connectedComponents(foreground_seeds)
-    if num_seeds <= 2:
-        return [binary_mask]
+    # 1. Foreground Points (4x4 Grid in central 70% of target box)
+    fg_x = np.linspace(tx1 + tbw * 0.15, tx2 - tbw * 0.15, 4)
+    fg_y = np.linspace(ty1 + tbh * 0.15, ty2 - tbh * 0.15, 4)
+    for x in fg_x:
+        for y in fg_y:
+            points.append([int(x), int(y)])
+            labels.append(1)
 
-    mask_3ch = cv2.cvtColor(binary_mask, cv2.COLOR_GRAY2BGR)
-    markers = markers + 1
-    markers[binary_mask == 0] = 0
+    # 2. Background Points (8 points sampling the padded perimeter)
+    bg_candidates = [
+        [tx1 / 2.0, ty1 / 2.0],                             # Top-Left pad
+        [tx1 + tbw / 2.0, ty1 / 2.0],                       # Top pad
+        [tx2 + (crop_w - tx2) / 2.0, ty1 / 2.0],            # Top-Right pad
+        [tx1 / 2.0, ty1 + tbh / 2.0],                       # Left pad
+        [tx2 + (crop_w - tx2) / 2.0, ty1 + tbh / 2.0],      # Right pad
+        [tx1 / 2.0, ty2 + (crop_h - ty2) / 2.0],            # Bottom-Left pad
+        [tx1 + tbw / 2.0, ty2 + (crop_h - ty2) / 2.0],      # Bottom pad
+        [tx2 + (crop_w - tx2) / 2.0, ty2 + (crop_h - ty2) / 2.0] # Bottom-Right pad
+    ]
 
-    cv2.watershed(mask_3ch, markers)
+    for px, py in bg_candidates:
+        # Only add background points if they lie within valid crop boundaries
+        if 0 <= px < crop_w and 0 <= py < crop_h:
+            points.append([int(px), int(py)])
+            labels.append(0)
 
-    split_masks = []
-    for label_id in range(2, num_seeds + 1):
-        sub_mask = np.zeros_like(binary_mask)
-        sub_mask[markers == label_id] = 255
-        if cv2.countNonZero(sub_mask) >= min_area:
-            split_masks.append(sub_mask)
-
-    return split_masks if split_masks else [binary_mask]
+    return points, labels
 
 
 async def detect_regions(image_url):
     """
-    Mask2Former (ADE20K) pipeline integrated with custom classification rules and heuristics.
+    Optimized Pipeline:
+    1. Grounding DINO -> Bounding Boxes & Confidence Scores
+    2. Padded Cropping + Positive/Negative Grid Point Sampling
+    3. SAM 3 -> Polygons & Predicted Boxes
+    4. Box Overlap Validation + Weighted Score Calculation
+    5. NMS Deduplication Pass
     """
+    if not settings.replicate_api_token or settings.replicate_api_token == "your-replicate-api-token":
+        return {"success": False, "error": "Replicate API token not configured.", "regions": []}
+
     uploads_dir = os.path.abspath(settings.upload_dir)
     
     if image_url.startswith("/uploads/"):
@@ -99,117 +164,221 @@ async def detect_regions(image_url):
     
     h, w = img.shape[:2]
     total_image_area = w * h
-    hf_token = settings.hf_api_token or os.environ.get("HF_API_TOKEN", "")
-
-    if not hf_token:
-        return {"success": False, "error": "HF API token missing", "regions": []}
-
-    try:
-        from huggingface_hub import InferenceClient
-        client = InferenceClient(api_key=hf_token, timeout=60,provider="hf-inference")
-        
-        logger.info("Executing Mask2Former ADE20K inference...")
-        raw_results = await asyncio.to_thread(
-            client.image_segmentation,
-            image=local_path,
-            model="facebook/mask2former-swin-large-ade-semantic"
-        )
-    except Exception as e:
-        logger.error(f"Mask2Former Inference failed: {e}")
-        return {"success": False, "error": f"HF Inference Error: {str(e)}", "regions": []}
-
-    regions = []
     min_area = total_image_area * 0.0002
 
-    for item in raw_results:
-        score = item.get("score", 1.0)
-        if score < 0.20:
-            continue
+    client = replicate.Client(api_token=settings.replicate_api_token)
 
-        label_raw = item.get("label", "").lower()
-        mask_data = item.get("mask")
-        if not mask_data or not hasattr(mask_data, "convert"):
+    dino_query = ",".join([
+        "roof", "wall", "window", "glass window", "door", 
+        "garage door", "balcony", "railing", "column", 
+        "pillar", "chimney", "gate", "fence", "parapet"
+    ])
+
+    try:
+        logger.info("Executing Grounding DINO detection...")
+        with open(local_path, "rb") as image_file:
+            dino_output = await asyncio.to_thread(
+                client.run,
+                "adirik/grounding-dino:efd10a8ddc57ea28773327e881ce95e20cc1d734c589f7dd01d2036921ed78aa",
+                input={
+                    "image": image_file,
+                    "query": dino_query,
+                    "box_threshold": 0.25,
+                    "text_threshold": 0.25,
+                    "show_visualisation": False
+                }
+            )
+    except Exception as e:
+        logger.error(f"Grounding DINO Inference failed: {e}")
+        return {"success": False, "error": f"Grounding DINO Error: {str(e)}", "regions": []}
+
+    detections = dino_output.get("detections", []) if isinstance(dino_output, dict) else (dino_output if isinstance(dino_output, list) else [])
+    
+    if not detections:
+        return {"success": True, "regions": [], "method": "grounding-dino-sam3-guided"}
+
+    logger.info(f"DINO found {len(detections)} potential regions. Parsing...")
+
+    raw_regions = []
+
+    for det in detections:
+        raw_label = det.get("label", "wall").lower()
+        norm_label = LABEL_MAP.get(raw_label, raw_label)
+        dino_conf = float(det.get("confidence", det.get("score", 0.85)))
+        
+        # 1. Dynamic Bounding Box Extraction
+        box_data = det.get("bbox") or det.get("box")
+        if not box_data:
             continue
             
-        mask_np = np.array(mask_data.convert("L"))
+        try:
+            if isinstance(box_data, dict):
+                x1 = float(box_data.get("xmin", box_data.get("x1", 0)))
+                y1 = float(box_data.get("ymin", box_data.get("y1", 0)))
+                x2 = float(box_data.get("xmax", box_data.get("x2", 0)))
+                y2 = float(box_data.get("ymax", box_data.get("y2", 0)))
+            elif isinstance(box_data, list) and len(box_data) == 4:
+                x1, y1, x2, y2 = map(float, box_data)
+                if x2 < x1 or y2 < y1:  # Fallback for [x, y, w, h] format
+                    x2 = x1 + x2
+                    y2 = y1 + y2
+            else:
+                continue
+        except Exception as e:
+            logger.warning(f"Failed to parse bbox {box_data}: {e}")
+            continue
 
-        if mask_np.shape[:2] != (h, w):
-            mask_np = cv2.resize(mask_np, (w, h), interpolation=cv2.INTER_NEAREST)
+        bw = x2 - x1
+        bh = y2 - y1
+        if bw <= 0 or bh <= 0:
+            continue
 
-        _, binary_mask = cv2.threshold(mask_np, 127, 255, cv2.THRESH_BINARY)
+        # 2. Padded Cropping (20% context pad)
+        pad_x = int(bw * 0.20)
+        pad_y = int(bh * 0.20)
+        
+        crop_x1 = max(0, int(x1) - pad_x)
+        crop_y1 = max(0, int(y1) - pad_y)
+        crop_x2 = min(w, int(x2) + pad_x)
+        crop_y2 = min(h, int(y2) + pad_y)
+        
+        crop_w = crop_x2 - crop_x1
+        crop_h = crop_y2 - crop_y1
+        
+        if crop_w < 10 or crop_h < 10:
+            continue
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
+        crop_img = img[crop_y1:crop_y2, crop_x1:crop_x2]
+        is_success, buffer = cv2.imencode(".jpg", crop_img)
+        if not is_success:
+            continue
+            
+        io_buf = io.BytesIO(buffer)
+        io_buf.name = "crop.jpg"
 
-        sub_masks = _split_mask_with_distance_transform(binary_mask, min_area)
+        # 3. Target region in crop-local coordinates
+        target_box_crop = [
+            int(x1 - crop_x1),
+            int(y1 - crop_y1),
+            int(x2 - crop_x1),
+            int(y2 - crop_y1)
+        ]
 
-        for sub_mask in sub_masks:
-            num_labels, labels_im, stats, _ = cv2.connectedComponentsWithStats(sub_mask, connectivity=8)
+        # 4. Generate Foreground (1) and Background (0) Points
+        pts, pt_labels = _generate_fg_bg_points(target_box_crop, crop_w, crop_h)
 
-            for comp_idx in range(1, num_labels):
-                area = stats[comp_idx, cv2.CC_STAT_AREA]
-                if area < min_area:
+        # 5. Execute SAM 3 on Crop
+        try:
+            sam_output = await asyncio.to_thread(
+                client.run,
+                "yodagg/sam3-image-seg:753fe4dbdd890a55e176f19b0603ae1b43c9e7fbd916070df53ffdb2451c7a57",
+                input={
+                    "image": io_buf,
+                    "prompt": norm_label,
+                    "points": json.dumps(pts),
+                    "point_labels": json.dumps(pt_labels),
+                    "return_polygons": True,
+                    "visualize_output": False,
+                    "multimask_output": True,
+                    "confidence_threshold": 0.4,
+                    "max_masks": 5
+                }
+            )
+        except Exception as sam_err:
+            logger.warning(f"SAM 3 failed for '{norm_label}' crop: {sam_err}")
+            continue
+
+        if not sam_output or not isinstance(sam_output, dict):
+            continue
+
+        pred_polygons = sam_output.get("pred_polygons", [])
+        pred_scores = sam_output.get("pred_scores", [])
+        pred_boxes = sam_output.get("pred_boxes", [])
+
+        if not pred_polygons or not pred_scores:
+            continue
+
+        # 6. Select and Validate Best Mask
+        best_idx = int(np.argmax(pred_scores))
+        best_sam_score = float(pred_scores[best_idx])
+
+        # Validate predicted mask box overlap against intended target box
+        if best_idx < len(pred_boxes):
+            sam_box = pred_boxes[best_idx]
+            if len(sam_box) == 4:
+                overlap_iou = _compute_bbox_iou(target_box_crop, sam_box)
+                if overlap_iou < 0.15:  # Reject mask if SAM drifted completely away from DINO target
+                    logger.debug(f"Rejected mask for {norm_label} due to low target overlap IoU ({overlap_iou:.2f})")
                     continue
 
-                comp_mask = np.zeros((h, w), dtype=np.uint8)
-                comp_mask[labels_im == comp_idx] = 255
+        # Weighted confidence calculation
+        combined_conf = (0.6 * dino_conf) + (0.4 * best_sam_score)
+        if combined_conf < 0.45:
+            continue
 
-                contours, _ = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if not contours:
-                    continue
+        # 7. Recursive Polygon Unwrapping
+        valid_pts = pred_polygons[best_idx]
+        while (
+            isinstance(valid_pts, list)
+            and len(valid_pts) > 0
+            and isinstance(valid_pts[0], list)
+            and len(valid_pts[0]) > 0
+            and isinstance(valid_pts[0][0], list)
+        ):
+            valid_pts = valid_pts[0]
 
-                largest_contour = max(contours, key=cv2.contourArea)
-                tx, ty, tbw, tbh = cv2.boundingRect(largest_contour)
+        if len(valid_pts) < 3:
+            continue
 
-                if tbw > 0.95 * w and tbh > 0.95 * h:
-                    continue
+        # 8. Translate coordinates to global image space
+        polygon = [
+            {
+                "x": float(pt[0]) + crop_x1, 
+                "y": float(pt[1]) + crop_y1
+            } 
+            for pt in valid_pts
+        ]
+        
+        pts_np = np.array([[pt["x"], pt["y"]] for pt in polygon], dtype=np.float32)
+        area = cv2.contourArea(pts_np)
+        
+        if area < min_area:
+            continue
 
-                rel_y = float(ty) / float(h)
+        tx, ty, tbw, tbh = cv2.boundingRect(pts_np)
+        if tbw > 0.95 * w and tbh > 0.95 * h:
+            continue
 
-                # Extract image crop for visual window heuristic
-                x_c, y_c, w_c, h_c = int(tx), int(ty), int(tbw), int(tbh)
-                img_crop = img[max(0, y_c):min(h, y_c+h_c), max(0, x_c):min(w, x_c+w_c)]
+        rel_y = float(ty) / float(h)
+        mapped_type = _classify_region_by_rules(norm_label, rel_y, tbw, tbh, w, h, crop_img)
 
-                # Classify using rules + visual crop
-                mapped_type = _classify_region_by_rules(label_raw, rel_y, tbw, tbh, w, h, img_crop)
+        raw_regions.append({
+            "id": f"{mapped_type}_{len(raw_regions)}",
+            "type": mapped_type,
+            "polygon": polygon,
+            "bbox": [float(tx), float(ty), float(tx + tbw), float(ty + tbh)],
+            "area": round(float(area), 1),
+            "confidence": round(combined_conf, 3),
+            "raw_label": norm_label
+        })
 
-                arc_len = cv2.arcLength(largest_contour, True)
-                if area < 4000:
-                    epsilon = 0.003 * arc_len
-                elif area < 20000:
-                    epsilon = 0.006 * arc_len
-                else:
-                    epsilon = 0.012 * arc_len
+    # 9. Non-Maximum Suppression (Deduplication)
+    deduped_regions = _apply_nms(raw_regions, iou_threshold=0.45)
+    deduped_regions.sort(key=lambda r: r["area"], reverse=True)
 
-                approx = cv2.approxPolyDP(largest_contour, epsilon, True)
-                polygon = [{"x": float(pt[0][0]), "y": float(pt[0][1])} for pt in approx]
-
-                if len(polygon) < 3:
-                    continue
-
-                regions.append({
-                    "id": f"{mapped_type}_{len(regions)}",
-                    "type": mapped_type,
-                    "polygon": polygon,
-                    "bbox": [float(tx), float(ty), float(tx + tbw), float(ty + tbh)],
-                    "area": round(float(area), 1),
-                    "confidence": round(float(score), 3),
-                    "raw_label": label_raw
-                })
-
-    regions.sort(key=lambda r: r["area"], reverse=True)
-
+    # Re-index labels cleanly
     counts = {}
-    for r in regions:
+    for r in deduped_regions:
         t = r["type"]
         counts[t] = counts.get(t, 0) + 1
         r["label"] = f"{t.replace('_', ' ').title()} {counts[t]}"
 
-    logger.info(f"Extracted {len(regions)} refined instance regions with heuristic rules")
+    logger.info(f"Extracted {len(deduped_regions)} deduplicated, high-precision architectural regions.")
+    
     return {
         "success": True,
-        "regions": regions,
-        "method": "mask2former-heuristic-rules"
+        "regions": deduped_regions,
+        "method": "dino-sam3-point-guided"
     }
 
 
